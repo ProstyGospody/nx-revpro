@@ -1,0 +1,227 @@
+#!/usr/bin/env bash
+# panel.sh — чтение/запись настроек 3x-ui в SQLite и доступ к HTTP API панели.
+#
+# Настройки читаем и пишем прямо в БД: install-result.env устаревает, как только
+# пользователь поменял порт или путь в UI, а форма "Panel Settings" умеет молча
+# сбрасывать subPath. БД — источник правды, поэтому после записи перечитываем.
+# shellcheck shell=bash
+
+# Дефолты 3x-ui: строка в таблице settings появляется, только если значение
+# отличается от встроенного, поэтому отсутствие ключа — это не пустая строка.
+declare -A XUI_DEFAULTS=(
+    [webPort]=2053         [webListen]=""        [webDomain]=""
+    [webCertFile]=""       [webKeyFile]=""       [webBasePath]="/"
+    [secret]=""            [sessionMaxAge]=60
+    [subEnable]="false"    [subListen]=""        [subPort]=2096
+    [subPath]="/sub/"      [subJsonPath]="/json/"
+    [subCertFile]=""       [subKeyFile]=""       [subDomain]=""
+    [subURI]=""            [subJsonURI]=""       [subUpdates]=12
+)
+
+NX_DB_SENTINEL=$'\x01'
+
+# экранирование одинарных кавычек для SQL
+sq() { local s=$1; printf '%s' "${s//\'/\'\'}"; }
+
+db_get() {
+    local k v
+    k=$(sq "$1")
+    v=$(sqlite3 -noheader "$XUI_DB" \
+        "SELECT COALESCE((SELECT value FROM settings WHERE key='$k' LIMIT 1), char(1));") \
+        || die "sqlite3: не смог прочитать settings.$1"
+    if [[ $v == "$NX_DB_SENTINEL" ]]; then
+        printf '%s' "${XUI_DEFAULTS[$1]-}"
+    else
+        printf '%s' "$v"
+    fi
+}
+
+db_set() {
+    local k v
+    k=$(sq "$1"); v=$(sq "$2")
+    sqlite3 "$XUI_DB" "
+BEGIN IMMEDIATE;
+UPDATE settings SET value='$v' WHERE key='$k';
+INSERT INTO settings (key, value) SELECT '$k', '$v'
+  WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key='$k');
+COMMIT;" || die "sqlite3: не смог записать settings.$1"
+}
+
+# panel_read_settings — заполняет глобальные PANEL_* из БД.
+panel_read_settings() {
+    PANEL_WEB_PORT=$(db_get webPort)
+    PANEL_WEB_LISTEN=$(db_get webListen)
+    PANEL_WEB_DOMAIN=$(db_get webDomain)
+    PANEL_WEB_CERT=$(db_get webCertFile)
+    PANEL_WEB_KEY=$(db_get webKeyFile)
+    PANEL_BASE_PATH=$(norm_path "$(db_get webBasePath)")
+    PANEL_SECRET=$(db_get secret)
+    PANEL_SUB_ENABLE=$(db_get subEnable)
+    PANEL_SUB_PORT=$(db_get subPort)
+    PANEL_SUB_LISTEN=$(db_get subListen)
+    PANEL_SUB_PATH=$(norm_path "$(db_get subPath)")
+    PANEL_SUB_JSON_PATH=$(norm_path "$(db_get subJsonPath)")
+}
+
+panel_report_settings() {
+    panel_read_settings
+    info "webPort      = $PANEL_WEB_PORT"
+    info "webListen    = ${PANEL_WEB_LISTEN:-<все интерфейсы>}"
+    info "webBasePath  = $PANEL_BASE_PATH"
+    info "webCertFile  = ${PANEL_WEB_CERT:-<пусто>}"
+    info "webDomain    = ${PANEL_WEB_DOMAIN:-<пусто>}"
+    info "subEnable    = $PANEL_SUB_ENABLE  subPort = $PANEL_SUB_PORT  subPath = $PANEL_SUB_PATH"
+}
+
+# panel_apply_settings <panel_domain> — приводит панель к виду "за nginx".
+# webBasePath НЕ трогаем: nginx подстраивается под то, что выбрал пользователь.
+panel_apply_settings() {
+    local panel_domain=$1 bak
+    panel_read_settings
+
+    bak=$(backup_file "$XUI_DB")
+    [[ -n $bak ]] && info "бэкап БД: $bak"
+
+    systemctl stop "$XUI_SERVICE" || die "не смог остановить $XUI_SERVICE"
+
+    # TLS терминирует nginx — панель должна отдавать чистый HTTP на loopback.
+    db_set webCertFile ""
+    db_set webKeyFile ""
+    db_set webListen "127.0.0.1"
+    # webDomain включает в панели проверку Host и ломает обращения к 127.0.0.1.
+    db_set webDomain ""
+
+    # Подписка — тем же nginx на 7443.
+    db_set subEnable "true"
+    db_set subListen "127.0.0.1"
+    db_set subCertFile ""
+    db_set subKeyFile ""
+    db_set subDomain ""
+    db_set subURI "https://${panel_domain}${PANEL_SUB_PATH}"
+    db_set subJsonURI "https://${panel_domain}${PANEL_SUB_JSON_PATH}"
+
+    systemctl start "$XUI_SERVICE" || die "не смог запустить $XUI_SERVICE"
+    panel_wait_up || die "панель не поднялась на 127.0.0.1:${PANEL_WEB_PORT}"
+
+    # Читаем обратно: 3x-ui умеет ронять subPath в "/" и терять webListen.
+    local before_sub=$PANEL_SUB_PATH before_base=$PANEL_BASE_PATH bad=0
+    panel_read_settings
+    [[ $PANEL_WEB_LISTEN == "127.0.0.1" ]] || { err "webListen не сохранился: '$PANEL_WEB_LISTEN'"; bad=1; }
+    [[ -z $PANEL_WEB_CERT && -z $PANEL_WEB_KEY ]] || { err "webCertFile/webKeyFile не очистились"; bad=1; }
+    [[ $PANEL_SUB_PATH == "$before_sub" ]] || { err "subPath уехал: '$before_sub' -> '$PANEL_SUB_PATH'"; bad=1; }
+    [[ $PANEL_BASE_PATH == "$before_base" ]] || { err "webBasePath уехал: '$before_base' -> '$PANEL_BASE_PATH'"; bad=1; }
+    (( bad == 0 )) || die "настройки панели не применились; исходная БД лежит в $bak"
+
+    ok "панель: http://127.0.0.1:${PANEL_WEB_PORT}${PANEL_BASE_PATH} (TLS снят, listen на loopback)"
+    ok "подписка: 127.0.0.1:${PANEL_SUB_PORT}${PANEL_SUB_PATH}"
+}
+
+panel_wait_up() {
+    local i
+    for i in $(seq 1 30); do
+        curl -sS -o /dev/null --max-time 3 \
+            "http://127.0.0.1:${PANEL_WEB_PORT}${PANEL_BASE_PATH}" 2>/dev/null && return 0
+        sleep 1
+    done
+    return 1
+}
+
+# --- учётные данные --------------------------------------------------------
+# install-result.env нужен только ради токена/логина. Имена ключей у разных
+# сборок 3x-ui разъезжаются, поэтому подбираем по списку кандидатов.
+
+panel_load_credentials() {
+    PANEL_TOKEN="${PANEL_TOKEN:-}"
+    PANEL_USER="${PANEL_USER:-}"
+    PANEL_PASS="${PANEL_PASS:-}"
+    [[ -n $PANEL_TOKEN || ( -n $PANEL_USER && -n $PANEL_PASS ) ]] && return 0
+    [[ -r $XUI_ENV ]] || return 0
+
+    local line k v lk
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ $line =~ ^[[:space:]]*# ]] && continue
+        [[ $line == *=* ]] || continue
+        k=${line%%=*}; v=${line#*=}
+        k=$(tr -d '[:space:]' <<<"$k")
+        v=${v%\"}; v=${v#\"}; v=${v%\'}; v=${v#\'}
+        lk=$(tr '[:upper:]' '[:lower:]' <<<"$k" | tr -d '_-')
+        case $lk in
+            token|apitoken|xuitoken|accesstoken|paneltoken)
+                [[ -z $PANEL_TOKEN ]] && PANEL_TOKEN=$v ;;
+            username|user|login|xuiusername|panelusername)
+                [[ -z $PANEL_USER ]] && PANEL_USER=$v ;;
+            password|pass|xuipassword|panelpassword)
+                [[ -z $PANEL_PASS ]] && PANEL_PASS=$v ;;
+        esac
+    done < "$XUI_ENV"
+    return 0
+}
+
+panel_base_url() { printf 'http://127.0.0.1:%s%s' "$PANEL_WEB_PORT" "$PANEL_BASE_PATH"; }
+
+# Подбирает рабочий способ аутентификации: PANEL_AUTH = token | cookie.
+panel_auth() {
+    panel_load_credentials
+    mkdir -p "$NX_RUN"; chmod 700 "$NX_RUN"
+
+    if [[ -n ${PANEL_TOKEN:-} ]]; then
+        if curl -fsS -o /dev/null --max-time 8 \
+             -H "Authorization: Bearer $PANEL_TOKEN" \
+             "$(panel_base_url)panel/api/inbounds/list" 2>/dev/null; then
+            PANEL_AUTH=token; ok "API: токен из $(basename "$XUI_ENV")"; return 0
+        fi
+        warn "токен из $XUI_ENV не подошёл — пробую логин/пароль"
+    fi
+
+    [[ -n ${PANEL_USER:-} && -n ${PANEL_PASS:-} ]] \
+        || die "нет доступа к API. Задайте PANEL_USER/PANEL_PASS (или PANEL_TOKEN) в $NX_CONF"
+
+    rm -f "$NX_COOKIE"
+    local body
+    local -a args=(-fsS --max-time 10 -c "$NX_COOKIE"
+                   --data-urlencode "username=$PANEL_USER"
+                   --data-urlencode "password=$PANEL_PASS")
+    [[ -n ${PANEL_SECRET:-} ]] && args+=(--data-urlencode "loginSecret=$PANEL_SECRET")
+    body=$(curl "${args[@]}" "$(panel_base_url)login" 2>/dev/null) \
+        || die "не смог залогиниться в панель на $(panel_base_url)"
+    [[ $(jq -r '.success // false' <<<"$body" 2>/dev/null) == true ]] \
+        || die "панель отклонила логин: $(jq -r '.msg // .' <<<"$body" 2>/dev/null)"
+    chmod 600 "$NX_COOKIE"
+    PANEL_AUTH=cookie
+    ok "API: сессия под пользователем $PANEL_USER"
+}
+
+# api <GET|POST> <путь относительно base> [json-тело]
+api() {
+    local method=$1 path=$2 data=${3:-}
+    local -a args=(-fsS --max-time 20 -X "$method")
+    case ${PANEL_AUTH:-} in
+        token)  args+=(-H "Authorization: Bearer $PANEL_TOKEN") ;;
+        cookie) args+=(-b "$NX_COOKIE" -c "$NX_COOKIE") ;;
+        *) die "panel_auth не вызывался" ;;
+    esac
+    [[ -n $data ]] && args+=(-H 'Content-Type: application/json' --data-binary "$data")
+    curl "${args[@]}" "$(panel_base_url)${path}" 2>/dev/null
+}
+
+api_ok() { [[ $(jq -r '.success // false' <<<"$1" 2>/dev/null) == true ]]; }
+
+# Пара ключей REALITY: сначала эндпоинтом панели, потом бинарником Xray.
+reality_keypair() {
+    local resp priv pub bin out
+    resp=$(api POST server/getNewX25519Cert "" 2>/dev/null) || resp=""
+    if api_ok "$resp"; then
+        priv=$(jq -r '.obj.privateKey // empty' <<<"$resp")
+        pub=$(jq -r '.obj.publicKey // empty' <<<"$resp")
+        [[ -n $priv && -n $pub ]] && { printf '%s %s' "$priv" "$pub"; return 0; }
+    fi
+    bin=$( { find /usr/local/x-ui/bin -maxdepth 1 -type f -name "xray-*" ! -name "*.dat" 2>/dev/null || true; } | head -n1 )
+    [[ -n $bin && -x $bin ]] || die "не смог сгенерировать ключи REALITY (ни API, ни бинарника xray)"
+    # Разные версии Xray печатают Private key: / PrivateKey: / Password: —
+    # берём последнее поле первых двух строк.
+    out=$("$bin" x25519) || die "xray x25519 завершился с ошибкой"
+    priv=$(sed -n '1p' <<<"$out" | awk '{print $NF}')
+    pub=$(sed -n '2p'  <<<"$out" | awk '{print $NF}')
+    [[ -n $priv && -n $pub ]] || die "не разобрал вывод xray x25519: $out"
+    printf '%s %s' "$priv" "$pub"
+}

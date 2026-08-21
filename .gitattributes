@@ -1,0 +1,4 @@
+# Всё исполняется на Linux: только LF. С CRLF bash падает на shebang
+# с "bad interpreter: /usr/bin/env bash^M", а nginx-конфиги приезжают битыми.
+* text=auto eol=lf
+*.sh text eol=lf
