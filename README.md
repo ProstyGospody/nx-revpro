@@ -1,187 +1,202 @@
+<div align="center">
+
+<img src="assets/logo.svg" alt="nx-revpro" width="88">
+
 # nx-revpro
 
-VLESS+REALITY за nginx-роутером по SNI, поверх уже установленной панели 3x-ui.
-Один публичный порт 443 отдаёт и панель, и прокси, и сайт-прикрытие.
+**VLESS + REALITY за nginx SNI-роутером.**
+Панель, прокси и сайт-прикрытие делят один публичный порт 443.
 
-Проверено на Ubuntu 24.04 + 3x-ui v3.6.0.
+![bash](https://img.shields.io/badge/bash-5.x-2f6df6?logo=gnubash&logoColor=white)
+![platform](https://img.shields.io/badge/Ubuntu%2022.04%20%7C%2024.04%20%7C%20Debian-0e9aa7?logo=ubuntu&logoColor=white)
+![3x-ui](https://img.shields.io/badge/3x--ui-v3.6.0-555)
+![transport](https://img.shields.io/badge/VLESS%2BREALITY-xtls--rprx--vision-2f6df6)
 
-## Как это устроено
+**Русский** · [English](README.en.md)
 
-```
-                                 ┌─ panel.example.com → 127.0.0.1:7443  nginx http/tls → панель :2053
-клиент → IP:443 → nginx stream ──┼─ decoy.example.com → 127.0.0.1:443   Xray REALITY
-          (ssl_preread)          └─ всё остальное     → 127.0.0.1:443   Xray REALITY
-                                                            │
-                                                fallback ───┴→ 127.0.0.1:9443  nginx http/tls → лендинг
-```
+</div>
 
-* **nginx stream** на `IP:443` смотрит SNI и раскидывает соединения, не расшифровывая их.
-* **`IP:443`, а не `0.0.0.0:443`** — принципиально. Иначе nginx занял бы и `127.0.0.1:443`,
-  а он нужен Xray: панель берёт порт для share-ссылки прямо из порта инбаунда,
-  отдельного поля «публичный порт» у неё нет. Значит инбаунд обязан жить на 443.
-* **PROXY-протокол включён** на обоих направлениях: у панели через `proxy_protocol`
-  в `listen`, у REALITY через `acceptProxyProtocol` в `tcpSettings`. Без этого
-  реальный IP клиента терялся бы, а nginx и Xray разошлись бы по формату.
-* **decoy-цель `127.0.0.1:9443`** — обычный nginx с настоящим сертификатом
-  Let's Encrypt на decoy-домен. Кто пришёл без валидного VLESS-рукопожатия,
-  видит живой сайт небольшой конторы, а не заглушку.
+---
 
-## Что нужно до запуска
+## Быстрый старт
 
-1. VPS с Ubuntu 22.04/24.04 или Debian, root.
-2. Два домена с A-записями на IP сервера:
-   * `panel.example.com` — панель и подписка;
-   * `decoy.example.com` — прикрытие и `serverName` для REALITY.
-3. Свободные порты 80 и 443.
-4. Установленная 3x-ui.
-
-### Установка 3x-ui
-
-Официальный установщик:
-
-```bash
-bash <(curl -Ls https://raw.githubusercontent.com/MHSanaei/3x-ui/master/install.sh)
-```
-
-Отвечайте так:
-
-| Вопрос установщика | Ответ | Почему |
-|---|---|---|
-| тип базы данных | **SQLite** | скрипт читает и правит `/etc/x-ui/x-ui.db` напрямую; MySQL не поддерживается |
-| настроить SSL сейчас | **Skip / пропустить** | сертификаты выпустит наш скрипт, TLS терминирует nginx |
-| адрес прослушивания | **127.0.0.1** | наружу панель смотрит только через nginx |
-
-Порт и путь панели выбирайте любые — скрипт прочитает их из БД и подстроит nginx.
-Логин, пароль и путь установщик кладёт в `/etc/x-ui/install-result.env`; сохраните их.
-
-## Запуск
-
-Под root, одной строкой:
+Под root, на сервере с уже установленной 3x-ui:
 
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/ProstyGospody/nx-revpro/main/setup.sh)
 ```
 
-Скрипт скачает репозиторий в `/opt/nx-revpro`, повесит команду `nxrev` в `/usr/local/bin`
-и спросит домены, e-mail и режим CA. Именно `bash <(...)`, а не `curl | bash`:
-при подстановке процесса stdin остаётся за терминалом, поэтому вопросы работают.
+Спросит два домена, e-mail и предложит первый прогон на тестовом CA. Всё остальное —
+сертификаты, конфиги nginx, настройки панели, инбаунд — сделает сам и в конце покажет
+`vless://`-ссылку с QR-кодом.
 
-Всё то же самое без вопросов — флаги передаются после закрывающей скобки:
-
-```bash
-bash <(curl -Ls https://raw.githubusercontent.com/ProstyGospody/nx-revpro/main/setup.sh) --panel panel.example.com --decoy decoy.example.com --email you@example.com --staging
-```
-
-Первый прогон стоит делать с `--staging`: у Let's Encrypt лимит 5 сертификатов
-на домен в неделю, и на отладке его легко сжечь. Когда проверки прошли —
-боевой выпуск, домены уже сохранены в конфиге:
+Те же аргументы можно передать сразу:
 
 ```bash
-sudo nxrev install --no-staging
+bash <(curl -Ls https://raw.githubusercontent.com/ProstyGospody/nx-revpro/main/setup.sh) \
+  --panel panel.example.com --decoy decoy.example.com --email you@example.com --staging
 ```
 
-Переменные окружения бутстрапа: `NX_REF` — ветка или тег (по умолчанию `main`),
-`NX_DEST` — каталог установки (по умолчанию `/opt/nx-revpro`).
+> [!TIP]
+> Первый раз запускайте с `--staging`. У Let's Encrypt лимит 5 сертификатов на домен
+> в неделю, и на отладке его легко сжечь. Когда проверки прошли — `sudo nxrev install --no-staging`.
 
-### Вручную, без бутстрапа
+## Как это устроено
+
+```
+                              ┌─ panel.example.com ──→ 127.0.0.1:7443
+                              │                        nginx · панель 3x-ui + подписка
+клиент ──→ IP:443 ────────────┤
+           nginx stream       │  decoy.example.com ─┐
+           ssl_preread        └─ всё остальное ─────┴→ 127.0.0.1:443
+                                                       Xray · VLESS+REALITY
+                                                          │
+                                                          └─ чужое рукопожатие
+                                                             ──→ 127.0.0.1:9443
+                                                                 nginx · прикрытие + LE-серт
+```
+
+Снаружи открыт ровно один порт. `ssl_preread` смотрит SNI, не расшифровывая трафик,
+и разводит соединения по трём адресам на loopback.
+
+**Почему nginx слушает конкретный IP, а не `0.0.0.0`.** Иначе он занял бы и `127.0.0.1:443`,
+который нужен Xray. А Xray обязан быть именно на 443, потому что 3x-ui берёт порт для
+share-ссылки прямо из порта инбаунда — отдельного поля «публичный порт» у неё нет.
+
+**Почему прикрытие настоящее.** Кто пришёл на decoy-домен без валидного VLESS-рукопожатия,
+попадает на обычный сайт небольшой конторы с живым сертификатом Let's Encrypt. Скрипт
+генерирует его сам: случайные название, ниша, палитра, год основания.
+
+**Где включён PROXY-протокол.** На обоих направлениях от stream-роутера: у панели через
+`proxy_protocol` в `listen`, у REALITY через `acceptProxyProtocol` в `tcpSettings`.
+Без этого терялся бы реальный IP клиента.
+
+## Перед запуском
+
+| Что | Зачем |
+|---|---|
+| VPS с Ubuntu 22.04/24.04 или Debian, root | другие дистрибутивы не поддерживаются |
+| два домена, оба A-записью на IP сервера | `panel` — панель и подписка, `decoy` — прикрытие и `serverName` для REALITY |
+| свободные порты 80 и 443 | скрипт проверит и откажется работать, если заняты |
+| установленная 3x-ui | ставится отдельно, см. ниже |
+
+<details>
+<summary><b>Установка 3x-ui и что отвечать установщику</b></summary>
+
+<br>
 
 ```bash
-git clone https://github.com/ProstyGospody/nx-revpro.git && cd nx-revpro
-sudo ./nxrev.sh install --panel panel.example.com --decoy decoy.example.com --email you@example.com --staging
+bash <(curl -Ls https://raw.githubusercontent.com/MHSanaei/3x-ui/master/install.sh)
 ```
 
-### Остальные команды
+| Вопрос | Ответ | Почему |
+|---|---|---|
+| тип базы данных | **SQLite** | скрипт читает и правит `/etc/x-ui/x-ui.db` напрямую, MySQL не поддерживается |
+| настроить SSL сейчас | **Skip** | сертификаты выпустит наш скрипт, TLS терминирует nginx |
+| адрес прослушивания | **127.0.0.1** | наружу панель смотрит только через nginx |
+
+Порт и путь панели выбирайте любые — они будут прочитаны из БД, и nginx подстроится.
+Логин, пароль и путь установщик кладёт в `/etc/x-ui/install-result.env`.
+
+</details>
+
+## Команды
 
 ```bash
 sudo nxrev status          # настройки панели, сроки сертификатов, сквозная проверка
-sudo nxrev links           # vless://-ссылки и QR для всех клиентов инбаунда
+sudo nxrev links           # vless://-ссылки и QR для всех клиентов
 sudo nxrev add-user alice  # добавить клиента и сразу показать ссылку
-sudo nxrev regen-decoy     # пересобрать лендинг с новым названием и нишей
+sudo nxrev regen-decoy     # пересобрать прикрытие с новым названием и нишей
+sudo nxrev install --help  # все флаги
 ```
 
-Обновление до свежей версии — тот же однострочник: код в `/opt/nx-revpro`
-перезаписывается, конфиг и состояние в `/etc/nx-revpro` не трогаются.
+Обновление — тот же однострочник: код в `/opt/nx-revpro` перезаписывается, конфиг
+и состояние в `/etc/nx-revpro` остаются. **Инбаунд при повторном запуске не трогается** —
+иначе перевыпустились бы ключи REALITY и отвалились клиенты. Скрипт только сверяет
+его с текущим nginx и ругается, если они разошлись.
 
-## Что скрипт делает с системой
+## Подробности
+
+<details>
+<summary><b>Что скрипт меняет в системе</b></summary>
+
+<br>
 
 | Что | Где |
 |---|---|
-| код скрипта и симлинк `nxrev` | `/opt/nx-revpro/`, `/usr/local/bin/nxrev` |
-| свои конфиги nginx | `/etc/nginx/conf.d/nx-revpro-*.conf`, `/etc/nginx/nx-revpro/` |
-| блок `stream{}` в главном конфиге | дописывается в конец `/etc/nginx/nginx.conf` между маркерами |
+| код и симлинк `nxrev` | `/opt/nx-revpro/`, `/usr/local/bin/nxrev` |
+| конфиги nginx | `/etc/nginx/conf.d/nx-revpro-*.conf`, `/etc/nginx/nx-revpro/` |
+| блок `stream{}` | дописывается в конец `/etc/nginx/nginx.conf` между маркерами |
 | дефолтный сайт Debian | отключается, копия в `/etc/nx-revpro/backup/` |
-| сайт-прикрытие | `/var/www/nx-revpro/decoy/` |
-| webroot для ACME | `/var/www/nx-revpro/acme/` |
+| сайт-прикрытие и webroot ACME | `/var/www/nx-revpro/` |
 | настройки панели | правятся в `/etc/x-ui/x-ui.db`, копия БД перед каждой записью |
 | deploy-hook certbot | `/etc/letsencrypt/renewal-hooks/deploy/nx-revpro-reload.sh` |
-| свой конфиг и состояние | `/etc/nx-revpro/nxrev.conf`, `/etc/nx-revpro/state.env` (0600) |
+| конфиг и состояние | `/etc/nx-revpro/nxrev.conf`, `/etc/nx-revpro/state.env` (0600) |
 
-Автопродление сертификатов делает штатный `certbot.timer`; hook только перезагружает nginx.
+Автопродление сертификатов делает штатный `certbot.timer`, hook только перезагружает nginx.
 
-### Какие настройки панели переписываются
+</details>
+
+<details>
+<summary><b>Какие настройки панели переписываются</b></summary>
+
+<br>
 
 | Ключ | Становится | Зачем |
 |---|---|---|
 | `webCertFile`, `webKeyFile` | пусто | TLS терминирует nginx, панель отдаёт чистый HTTP |
-| `webListen` | `127.0.0.1` | снаружи панель недоступна напрямую |
-| `webDomain` | пусто | иначе панель включает проверку Host и отбивает запросы на `127.0.0.1` |
+| `webListen` | `127.0.0.1` | снаружи панель напрямую недоступна |
+| `webDomain` | пусто | иначе панель включает проверку `Host` и отбивает запросы на `127.0.0.1` |
 | `subEnable`, `subListen` | `true`, `127.0.0.1` | подписка ходит через тот же nginx |
-| `subURI`, `subJsonURI` | `https://<panel-домен>/...` | чтобы панель выдавала клиентам публичный адрес |
+| `subURI`, `subJsonURI` | `https://<panel-домен>/…` | чтобы панель выдавала клиентам публичный адрес |
 
 `webPort`, `webBasePath`, `subPath` и `subJsonPath` **не трогаются** — nginx строится под них.
-Настройки читаются из БД, а не из `install-result.env`: этот файл устаревает сразу,
-как только вы поменяете порт или путь в UI. Из него берётся только токен/логин для API.
 
-## Повторный запуск
+Настройки читаются из БД, а не из `install-result.env`: этот файл устаревает сразу, как
+только вы поменяете порт или путь в UI. Из него берётся только токен или логин для API.
 
-`install` идемпотентен:
+</details>
 
-* конфиги nginx и лендинг перегенерируются (лендинг — только по `--regen-decoy`,
-  иначе домен на глазах наблюдателя менял бы название и нишу);
-* сертификат перевыпускается только если ему осталось меньше 30 дней или сменился тип staging/боевой;
-* **инбаунд не трогается вообще** — иначе перевыпустились бы ключи REALITY и отвалились клиенты.
-  Скрипт только сверяет его с текущим nginx и ругается, если они разошлись;
-* если сертификаты уже есть, порт 443 на время прогона не снимается.
+<details>
+<summary><b>Грабли, на которые уже наступили</b></summary>
 
-## Грабли, на которые уже наступили
+<br>
 
-* **Порт в share-ссылке** жёстко берётся из порта инбаунда. Отдельного поля нет,
-  и Custom share address задаёт только адрес. Поэтому инбаунд обязан быть на 443.
-* **`subPath` иногда не сохраняется** и сбрасывается в `/`. Скрипт пишет настройки
-  в БД при остановленной панели, а после старта перечитывает и падает с ошибкой,
-  если значение уехало.
-* **Proxy Protocol нужен не всем**: `ON` для REALITY (наш случай), `OFF` для WS и XHTTP.
-  Если будете добавлять такой инбаунд руками — ему нужен отдельный маршрут в stream-роутере
-  без `proxy_protocol`.
-* **certbot только webroot**, не standalone: nginx уже держит `:80`, а останавливать
-  его ради продления нельзя.
-* **`--staging` для отладки.** Лимит боевого CA — 5 сертификатов на домен в неделю.
+- **Порт в share-ссылке** жёстко берётся из порта инбаунда. Отдельного поля нет,
+  Custom share address задаёт только адрес. Поэтому инбаунд обязан быть на 443.
+- **`subPath` иногда не сохраняется** и сбрасывается в `/`. Скрипт пишет настройки в БД
+  при остановленной панели, а после старта перечитывает и падает с ошибкой, если уехало.
+- **Proxy Protocol нужен не всем**: `ON` для REALITY, `OFF` для WS и XHTTP. Если будете
+  добавлять такой инбаунд руками, ему нужен отдельный маршрут без `proxy_protocol`.
+- **certbot только webroot**, не standalone: nginx уже держит `:80`, останавливать его
+  ради продления нельзя.
 
-## Диагностика
+</details>
+
+<details>
+<summary><b>Если что-то не работает</b></summary>
+
+<br>
 
 ```bash
 sudo nxrev status
-```
-
-Если что-то не сходится:
-
-```bash
-sudo nginx -t                                   # синтаксис конфигов
-sudo ss -lntp | grep -E ':(80|443|7443|9443|2053)'
-sudo journalctl -u x-ui -n 50 --no-pager        # панель и Xray
+sudo nginx -t
+sudo ss -lntp | grep -E ':(80|443|7443|9443)'
+sudo journalctl -u x-ui -n 50 --no-pager
 sudo tail -n 50 /var/log/nginx/nx-revpro-stream.log
-openssl s_client -connect <IP>:443 -servername decoy.example.com </dev/null 2>/dev/null | openssl x509 -noout -issuer -subject
 ```
 
-Частые причины:
+| Симптом | Обычная причина |
+|---|---|
+| `127.0.0.1:443` слушает не Xray | nginx забиндился на `0.0.0.0` — проверьте `BIND_IP` в `/etc/nx-revpro/nxrev.conf` |
+| REALITY не отдаёт прикрытие | не совпал `serverNames[0]` с decoy-доменом или `dest` смотрит не на `127.0.0.1:9443` |
+| панель отвечает 502 | `webListen` не `127.0.0.1` либо `webCertFile` не очищен и панель говорит по TLS |
 
-* `127.0.0.1:443` слушает не Xray — значит nginx забиндился на `0.0.0.0`; проверьте `BIND_IP` в `/etc/nx-revpro/nxrev.conf`.
-* REALITY не отдаёт fallback — не совпал `serverNames[0]` с decoy-доменом или `dest` смотрит не на `127.0.0.1:9443`.
-* Панель отвечает 502 — `webListen` не `127.0.0.1` либо `webCertFile` не очищен и панель говорит по TLS.
+</details>
 
 ## Ограничения
 
-* Только Debian/Ubuntu, только SQLite-режим 3x-ui, только IPv4.
-* Единственный транспорт — VLESS+REALITY поверх TCP с `flow=xtls-rprx-vision`.
-* Удаления скрипт не умеет: снимается вручную — убрать `nx-revpro-*.conf`,
-  блок между маркерами в `nginx.conf`, `/etc/nx-revpro` и `/var/www/nx-revpro`.
+Только Debian/Ubuntu, только SQLite-режим 3x-ui, только IPv4. Единственный транспорт —
+VLESS+REALITY поверх TCP с `flow=xtls-rprx-vision`. Удаления скрипт не умеет: снимается
+вручную — убрать `nx-revpro-*.conf`, блок между маркерами в `nginx.conf`, `/etc/nx-revpro`
+и `/var/www/nx-revpro`.
