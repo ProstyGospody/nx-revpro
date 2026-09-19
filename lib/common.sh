@@ -132,3 +132,19 @@ port_taken_by() {
           if (pt == p && (ad == a || ad == "*" || ad == "0.0.0.0" || ad == "[::]"))
               { print $0; exit } }'
 }
+
+# Принадлежит ли процесс указанному systemd-юниту. На systemd это надёжнее,
+# чем сравнение имён: одноимённых процессов может быть несколько, и только
+# cgroup говорит, кто из них наш.
+pid_in_unit() {
+    local pid=$1 unit=$2
+    [[ -n $pid && -r /proc/$pid/cgroup ]] || return 1
+    grep -q "$unit" "/proc/$pid/cgroup"
+}
+
+pid_cmdline() {
+    [[ -r /proc/$1/cmdline ]] || return 1
+    tr '\0' ' ' < "/proc/$1/cmdline"
+}
+
+pids_from_ss() { grep -oE 'pid=[0-9]+' <<<"$1" | cut -d= -f2 | sort -u; }

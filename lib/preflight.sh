@@ -106,20 +106,40 @@ check_dns() {
 }
 
 # Порты, которые должны быть свободны (либо заняты уже нашим nginx).
+# Порты, которые должны быть свободны либо принадлежать нашему nginx.
+# Проверять по имени процесса мало: посторонний nginx, запущенный вне
+# nginx.service, тоже называется nginx, но наши конфиги ему неизвестны —
+# он будет отвечать 404, пока systemd-экземпляр не может занять порт.
 preflight_ports() {
-    local bind=$1 hit
+    local bind=$1 hit pid
     local -a checks=("$bind 80" "$bind 443" "127.0.0.1 7443" "127.0.0.1 9443")
     local c addr port
+
     for c in "${checks[@]}"; do
         read -r addr port <<<"$c"
         hit=$(port_taken_by "$addr" "$port")
         [[ -z $hit ]] && continue
-        if grep -q '"nginx"' <<<"$hit"; then
-            info "$addr:$port уже за nginx — переиспользую"
-        else
-            die "$addr:$port занят посторонним процессом: $(sed 's/.*users://' <<<"$hit")"
+
+        pid=$(pids_from_ss "$hit" | head -1)
+        if grep -q '"nginx"' <<<"$hit" && pid_in_unit "$pid" 'nginx.service'; then
+            info "$addr:$port уже за nginx.service — переиспользую"
+            continue
         fi
+
+        if grep -q '"nginx"' <<<"$hit"; then
+            err "$addr:$port держит nginx, не относящийся к nginx.service (pid ${pid:-?})"
+            err "  команда: $(pid_cmdline "$pid" 2>/dev/null || echo '<не прочитать>')"
+            err "  cgroup:  $(head -1 "/proc/$pid/cgroup" 2>/dev/null || echo '<не прочитать>')"
+            err "Наши конфиги лежат в ${NX_NGINX_CONFD:-/etc/nginx/conf.d}, но этот процесс"
+            err "их не читал — запросы будут получать 404, а systemd-экземпляр не сможет"
+            err "занять порт (bind: Address already in use)."
+            err "Остановите посторонний экземпляр и запустите install заново."
+            die "$addr:$port занят чужим nginx"
+        fi
+
+        die "$addr:$port занят посторонним процессом: $(sed 's/.*users://' <<<"$hit")"
     done
+
     # 127.0.0.1:443 должен остаться за Xray, а не за nginx
     hit=$(ss -lntpH 2>/dev/null | awk '$4 == "127.0.0.1:443"')
     if [[ -n $hit ]] && ! grep -qE '"xray|"x-ui' <<<"$hit"; then

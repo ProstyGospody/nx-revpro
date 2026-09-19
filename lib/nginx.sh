@@ -282,13 +282,24 @@ nginx_test() {
     ok "nginx -t в порядке"
 }
 
+# Перезагрузка с проверкой результата. Раньше при неактивном nginx.service
+# скрипт просто делал `enable --now`, и если порт держал посторонний процесс,
+# запуск падал с bind: Address already in use — молча, в error.log.
 nginx_reload() {
     nginx_test
+
     if systemctl is-active --quiet nginx; then
         systemctl reload nginx || die "nginx reload не удался"
     else
-        systemctl enable --now nginx || die "nginx не стартует"
+        if ! systemctl enable --now nginx 2>/dev/null; then
+            err "nginx.service не запустился. Последние строки error.log:"
+            tail -n 5 /var/log/nginx/error.log 2>/dev/null | sed 's/^/      /' >&2 || true
+            die "nginx не стартует"
+        fi
     fi
+
+    systemctl is-active --quiet nginx \
+        || die "nginx.service не активен после перезагрузки конфигов"
     ok "nginx перезагружен"
 }
 
