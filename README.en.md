@@ -153,7 +153,9 @@ Renewal is handled by the stock `certbot.timer`; the hook only reloads nginx.
 `webPort`, `webBasePath`, `subPath` and `subJsonPath` are **left alone** — nginx is built around them.
 
 Settings are read from the database rather than `install-result.env`, which goes stale the
-moment you change the port or path in the UI. Only the API token or login is taken from it.
+moment you change the port or path in the UI. The API login and password come from the
+same place — the `users` table. `install-result.env` is only a fallback: it is written once
+at install time and knows nothing about a password changed later in the UI.
 
 </details>
 

@@ -149,13 +149,28 @@ panel_wait_up() {
 # install-result.env нужен только ради токена/логина. Имена ключей у разных
 # сборок 3x-ui разъезжаются, поэтому подбираем по списку кандидатов.
 
-panel_load_credentials() {
-    PANEL_TOKEN="${PANEL_TOKEN:-}"
-    PANEL_USER="${PANEL_USER:-}"
-    PANEL_PASS="${PANEL_PASS:-}"
-    [[ -n $PANEL_TOKEN || ( -n $PANEL_USER && -n $PANEL_PASS ) ]] && return 0
-    [[ -r $XUI_ENV ]] || return 0
+# Пароль берём у самой панели, а не из install-result.env: тот файл пишется
+# один раз при установке и устаревает, как только пароль сменили в UI.
+# Таблица users — то же самое, что показывает `x-ui setting -show true`.
+_creds_from_db() {
+    local row u p
+    row=$(sqlite3 -noheader -separator '|' "$XUI_DB" \
+          "SELECT username, password FROM users ORDER BY id LIMIT 1;" 2>/dev/null) || return 1
+    u=${row%%|*}; p=${row#*|}
+    [[ -n $u && -n $p && $u != "$row" ]] || return 1
 
+    # Свежие сборки хранят хеш. Исходный пароль из него не достать.
+    case $p in
+        '$2a$'*|'$2b$'*|'$2y$'*|'$argon2'*|'$pbkdf2'*) NX_PASS_HASHED=1; return 2 ;;
+    esac
+    PANEL_USER=$u
+    PANEL_PASS=$p
+    return 0
+}
+
+# Запасной источник: файл, который установщик 3x-ui пишет один раз.
+_creds_from_env() {
+    [[ -r $XUI_ENV ]] || return 1
     local line k v lk
     while IFS= read -r line || [[ -n $line ]]; do
         [[ $line =~ ^[[:space:]]*# ]] && continue
@@ -166,13 +181,45 @@ panel_load_credentials() {
         lk=$(tr '[:upper:]' '[:lower:]' <<<"$k" | tr -d '_-')
         case $lk in
             token|apitoken|xuitoken|accesstoken|paneltoken)
-                [[ -z $PANEL_TOKEN ]] && PANEL_TOKEN=$v ;;
+                [[ -z ${PANEL_TOKEN:-} ]] && PANEL_TOKEN=$v ;;
             username|user|login|xuiusername|panelusername)
-                [[ -z $PANEL_USER ]] && PANEL_USER=$v ;;
+                [[ -z ${PANEL_USER:-} ]] && PANEL_USER=$v ;;
             password|pass|xuipassword|panelpassword)
-                [[ -z $PANEL_PASS ]] && PANEL_PASS=$v ;;
+                [[ -z ${PANEL_PASS:-} ]] && PANEL_PASS=$v ;;
         esac
     done < "$XUI_ENV"
+    [[ -n ${PANEL_USER:-} && -n ${PANEL_PASS:-} ]]
+}
+
+panel_load_credentials() {
+    PANEL_TOKEN="${PANEL_TOKEN:-}"
+    PANEL_USER="${PANEL_USER:-}"
+    PANEL_PASS="${PANEL_PASS:-}"
+    NX_PASS_HASHED=0
+
+    if [[ -n $PANEL_TOKEN || ( -n $PANEL_USER && -n $PANEL_PASS ) ]]; then
+        info "учётные данные: заданы в $NX_CONF"
+        return 0
+    fi
+
+    local rc=0
+    _creds_from_db || rc=$?
+    case $rc in
+        0) info "учётные данные: из БД панели, пользователь '$PANEL_USER'"; return 0 ;;
+        2) warn "пароль в БД хранится хешем — исходный из него не восстановить" ;;
+    esac
+
+    # При хешированном пароле сам пароль не менялся, только способ хранения,
+    # поэтому значение из install-result.env ещё может подойти.
+    if _creds_from_env; then
+        if (( NX_PASS_HASHED )); then
+            info "учётные данные: из $(basename "$XUI_ENV") (проверить по БД нельзя)"
+        else
+            warn "учётные данные: из $(basename "$XUI_ENV") — этот файл мог устареть"
+        fi
+        return 0
+    fi
+
     return 0
 }
 
@@ -181,17 +228,25 @@ panel_base_url() { printf 'http://127.0.0.1:%s%s' "$PANEL_WEB_PORT" "$PANEL_BASE
 # Подсказка, общая для всех случаев «панель не пустила».
 _auth_probe() {
     err ""
-    err "Что посмотреть:"
-    err "  1. Реальные учётные данные панели (3x-ui умеет их показать):"
-    err "       x-ui setting -show true"
-    err "  2. Включены ли secret-токен или второй фактор:"
-    err "       sqlite3 $XUI_DB \"select key, value from settings where key like '%secret%' or key like '%twoFactor%' or key = 'webDomain'\""
-    err "  3. Что панель записала о попытке входа:"
-    err "       journalctl -u $XUI_SERVICE -n 30 --no-pager"
+    if (( ${NX_PASS_HASHED:-0} )); then
+        err "Пароль в БД хранится хешем, поэтому он взят из $(basename "$XUI_ENV")"
+        err "и, судя по всему, устарел."
+    else
+        err "Логин и пароль взяты из БД панели, но она их не приняла."
+    fi
     err ""
-    err "Если пароль просто другой — впишите рабочий и запустите install заново:"
-    err "    echo 'PANEL_USER=логин'  >> $NX_CONF"
-    err "    echo 'PANEL_PASS=пароль' >> $NX_CONF"
+    err "Что посмотреть:"
+    err "  1. Что показывает сама панель:"
+    err "       x-ui setting -show true"
+    err "  2. Включён ли второй фактор:"
+    err "       sqlite3 $XUI_DB \"select key, value from settings where key like '%woFactor%'\""
+    err ""
+    err "Задать заведомо рабочий пароль (панель умеет сама):"
+    err "       x-ui setting -username НОВЫЙ_ЛОГИН -password НОВЫЙ_ПАРОЛЬ"
+    err "Либо прописать существующий в конфиг:"
+    err "       echo 'PANEL_USER=логин'  >> $NX_CONF"
+    err "       echo 'PANEL_PASS=пароль' >> $NX_CONF"
+    err ""
     err "Если включён второй фактор — его придётся выключить на время установки:"
     err "скрипт ходит в API без участия человека и TOTP-код взять неоткуда."
     err ""
