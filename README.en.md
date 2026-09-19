@@ -105,15 +105,20 @@ them. The installer writes the login, password and path to `/etc/x-ui/install-re
 ```bash
 sudo nxrev status          # panel settings, certificate expiry, end-to-end check
 sudo nxrev links           # vless:// links and QR codes for every client
-sudo nxrev add-user alice  # add a client and print its link
 sudo nxrev regen-decoy     # rebuild the decoy site with a new name and industry
 sudo nxrev install --help  # every flag
 ```
 
 To update, run the same one-liner: the code in `/opt/nx-revpro` is replaced, while the
-config and state in `/etc/nx-revpro` are kept. **The inbound is never touched on re-runs** —
-that would regenerate the REALITY keys and break every existing client. The script only
-compares it against the current nginx setup and warns if the two have drifted apart.
+config and state in `/etc/nx-revpro` are kept.
+
+### The inbound is created by hand
+
+The script neither creates nor edits it. The 3x-ui API shifts between releases — login
+format, CSRF, the type of the `tgId` field — so automatic creation would break on every
+panel upgrade. You create the inbound and its clients in the UI; the script reads them
+from the database, checks them against the nginx setup and builds the `vless://` links.
+It prints the exact parameters at the end of the install.
 
 ## Details
 
@@ -153,9 +158,8 @@ Renewal is handled by the stock `certbot.timer`; the hook only reloads nginx.
 `webPort`, `webBasePath`, `subPath` and `subJsonPath` are **left alone** — nginx is built around them.
 
 Settings are read from the database rather than `install-result.env`, which goes stale the
-moment you change the port or path in the UI. The API login and password come from the
-same place — the `users` table. `install-result.env` is only a fallback: it is written once
-at install time and knows nothing about a password changed later in the UI.
+moment you change the port or path in the UI. The script needs no credentials at all: it never calls the panel API and never reads
+`install-result.env`.
 
 </details>
 

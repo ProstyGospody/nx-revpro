@@ -39,11 +39,9 @@ XRAY_PORT=443            # порт инбаунда = порт в share-ссы�
 PANEL_HTTPS_PORT=7443
 DECOY_HTTPS_PORT=9443
 INBOUND_REMARK="nx-reality"
-FIRST_CLIENT="owner"
 
-NX_CONF_TOKEN=""
-NX_CONF_USER=""
-NX_CONF_PASS=""
+NX_INBOUND_MISSING=0
+NX_INBOUND_BROKEN=0
 
 NX_HTTP2_LISTEN=""
 NX_HTTP2_DIRECTIVE=""
@@ -55,7 +53,6 @@ nx-revpro — VLESS+REALITY за nginx SNI-роутером.
   nxrev.sh install --panel <домен> --decoy <домен> [--email <адрес>] [опции]
   nxrev.sh status
   nxrev.sh links
-  nxrev.sh add-user <имя>
   nxrev.sh regen-decoy
 
 Опции install:
@@ -71,8 +68,11 @@ nx-revpro — VLESS+REALITY за nginx SNI-роутером.
   --force             не падать, если DNS ещё не разъехался
   -h, --help          эта справка
 
-Повторный запуск install безопасен: конфиги и сертификаты обновляются,
-существующий инбаунд не трогается.
+Инбаунд создаётся руками в панели: API 3x-ui меняется от версии к версии,
+и автосоздание ломалось бы на каждом обновлении. Скрипт его находит, сверяет
+с конфигурацией nginx и показывает ссылки.
+
+Повторный запуск install безопасен: конфиги и сертификаты обновляются.
 USAGE
 }
 
@@ -80,10 +80,6 @@ load_conf() {
     [[ -r $NX_CONF ]] || return 0
     # shellcheck disable=SC1090
     . "$NX_CONF"
-    # Запоминаем ровно то, что задал человек: только это уйдёт обратно в файл.
-    NX_CONF_TOKEN=${PANEL_TOKEN:-}
-    NX_CONF_USER=${PANEL_USER:-}
-    NX_CONF_PASS=${PANEL_PASS:-}
 }
 
 save_conf() {
@@ -105,13 +101,6 @@ XRAY_PORT=$XRAY_PORT
 PANEL_HTTPS_PORT=$PANEL_HTTPS_PORT
 DECOY_HTTPS_PORT=$DECOY_HTTPS_PORT
 
-# Доступ к API панели. Если пусто — логин и пароль читаются из таблицы users
-# в $XUI_DB, а при неудаче из $XUI_ENV. Заполняйте, только если нужен свой.
-# Заданное здесь перекрывает БД, поэтому устаревшее значение тут вреднее,
-# чем пустая строка.
-PANEL_TOKEN="$NX_CONF_TOKEN"
-PANEL_USER="$NX_CONF_USER"
-PANEL_PASS="$NX_CONF_PASS"
 CONF
     )
     chmod 600 "$NX_CONF"
@@ -181,12 +170,7 @@ cmd_install() {
     step "Привожу панель к работе за nginx"
     panel_apply_settings "$PANEL_DOMAIN"
 
-    # Пишем конфиг сразу: если дальше что-то упадёт, в нём уже есть куда
-    # положить PANEL_USER/PANEL_PASS для повторного запуска.
     save_conf
-
-    step "Доступ к API панели"
-    panel_auth
 
     step "Сайт-прикрытие"
     decoy_generate "$REGEN_DECOY"
@@ -208,7 +192,7 @@ cmd_install() {
     nginx_phase_full
 
     step "Инбаунд VLESS+REALITY"
-    ensure_inbound
+    report_inbound
 
     step "Проверка"
     save_conf
@@ -217,55 +201,49 @@ cmd_install() {
     print_summary
 }
 
-ensure_inbound() {
-    local inb
+# Инбаунд заводится руками в панели. Скрипт его только находит и сверяет с
+# тем, что настроил nginx: создавать через API — значит ломаться на каждом
+# обновлении панели, как это и случилось с типом поля tgId.
+report_inbound() {
+    local inb clash
     inb=$(inbound_find "$INBOUND_REMARK")
 
     if [[ -z $inb ]]; then
-        local clash
         clash=$(inbound_find_by_port "$XRAY_PORT")
-        [[ -n $clash ]] && die "порт $XRAY_PORT уже занят инбаундом '$(jq -r .remark <<<"$clash")' — переименуйте его или задайте --remark"
-        inbound_create "$FIRST_CLIENT" > /dev/null
-        inb=$(inbound_find "$INBOUND_REMARK")
-        [[ -n $inb ]] || die "инбаунд создан, но не нашёлся в списке"
-        wait_listen 127.0.0.1 "$XRAY_PORT" 20 || warn "Xray ещё не слушает 127.0.0.1:$XRAY_PORT"
+        if [[ -n $clash ]]; then
+            warn "инбаунда '$INBOUND_REMARK' нет, но порт $XRAY_PORT занят инбаундом '$(jq -r .remark <<<"$clash")'"
+            inb=$clash
+        else
+            NX_INBOUND_MISSING=1
+            warn "инбаунд не найден — создайте его в панели, параметры ниже"
+            return 0
+        fi
+    fi
+
+    if inbound_check "$inb"; then
+        ok "инбаунд '$(jq -r .remark <<<"$inb")' сходится с конфигурацией nginx"
     else
-        ok "инбаунд '$INBOUND_REMARK' уже есть — не трогаю, только сверяю"
-        check_inbound "$inb"
+        NX_INBOUND_BROKEN=1
+        err "инбаунд не сходится с конфигурацией nginx — поправьте в панели"
     fi
 
     state_set INBOUND_ID "$(jq -r '.id' <<<"$inb")"
     state_set REALITY_PUBLIC_KEY \
-        "$(jq -r '.streamSettings | fromjson | .realitySettings.settings.publicKey // ""' <<<"$inb")"
+        "$(jq -r '.streamSettings // "{}" | fromjson? | .realitySettings.settings.publicKey // ""' <<<"$inb" 2>/dev/null || true)"
 }
 
-# Существующий инбаунд не правим (это перевыпустило бы ключи и сломало клиентов),
-# но обязаны сказать, если он разошёлся с тем, что настроил nginx.
-check_inbound() {
-    local inb=$1 ss v
-    ss=$(jq -r '.streamSettings' <<<"$inb")
+# Что показать человеку, если инбаунда ещё нет либо он разъехался.
+print_inbound_instructions() {
+    printf '\n%s--- Инбаунд нужно завести в панели ---%s\n' "$C_YEL" "$C_OFF"
+    printf 'Панель: https://%s%s\n\n' "$PANEL_DOMAIN" "$PANEL_BASE_PATH"
+    inbound_expected_hint
+    cat <<'TAIL'
 
-    v=$(jq -r '.port' <<<"$inb")
-    [[ $v == "$XRAY_PORT" ]] || warn "инбаунд на порту $v — именно его панель положит в share-ссылку, а снаружи слушается $PUBLIC_PORT"
-    v=$(jq -r '.listen // ""' <<<"$inb")
-    [[ $v == "127.0.0.1" ]] || warn "инбаунд слушает '${v:-все интерфейсы}', ожидалось 127.0.0.1"
-    v=$(jq -r '.tcpSettings.acceptProxyProtocol // false' <<<"$ss")
-    [[ $v == true ]] || err "у инбаунда acceptProxyProtocol=false, а stream-роутер шлёт PROXY — соединения не поднимутся"
-    v=$(jq -r '.realitySettings.dest // ""' <<<"$ss")
-    [[ $v == "127.0.0.1:${DECOY_HTTPS_PORT}" ]] || warn "realitySettings.dest = '$v', ожидалось 127.0.0.1:${DECOY_HTTPS_PORT}"
-    v=$(jq -r '.realitySettings.serverNames[0] // ""' <<<"$ss")
-    [[ $v == "$DECOY_DOMAIN" ]] || warn "serverNames[0] = '$v', а сертификат выписан на $DECOY_DOMAIN"
-}
+  Публичный ключ REALITY панель сгенерирует сама кнопкой "Get New Cert".
+  Клиентов добавляйте там же; flow у каждого — xtls-rprx-vision.
 
-# Панель перезапускает Xray асинхронно — даём инбаунду встать, иначе проверка
-# постучится в 127.0.0.1:443 раньше, чем там кто-то появится.
-wait_listen() {
-    local addr=$1 port=$2 tries=${3:-20} i
-    for (( i = 0; i < tries; i++ )); do
-        _listening "$addr" "$port" && return 0
-        sleep 1
-    done
-    return 1
+Потом:  nxrev links   — покажет vless://-ссылки и QR
+TAIL
 }
 
 # --- проверки --------------------------------------------------------------
@@ -289,17 +267,31 @@ do_verify() {
                 "127.0.0.1 ${DECOY_HTTPS_PORT} nginx-decoy" \
                 "127.0.0.1 ${XRAY_PORT} xray-reality"; do
         read -r a p name <<<"$spec"
-        if _listening "$a" "$p"; then ok "слушает $a:$p ($name)"
-        else err "никто не слушает $a:$p ($name)"; rc=1; fi
+        if _listening "$a" "$p"; then
+            ok "слушает $a:$p ($name)"
+        elif [[ $name == xray-reality && ${NX_INBOUND_MISSING:-0} == 1 ]]; then
+            info "127.0.0.1:$p свободен — инбаунда ещё нет, это ожидаемо"
+        else
+            err "никто не слушает $a:$p ($name)"; rc=1
+        fi
     done
 
     code=$(_http_code "$PANEL_DOMAIN" "$PANEL_BASE_PATH")
     if [[ $code == 200 ]]; then ok "панель через SNI-роутер отвечает 200"
     else err "панель по https://${PANEL_DOMAIN}${PANEL_BASE_PATH} вернула $code"; rc=1; fi
 
-    code=$(_http_code "$DECOY_DOMAIN" "/")
-    if [[ $code == 200 ]]; then ok "прикрытие через REALITY-fallback отвечает 200"
-    else err "https://${DECOY_DOMAIN}/ вернул $code (REALITY не отдал соединение на :${DECOY_HTTPS_PORT})"; rc=1; fi
+    if [[ ${NX_INBOUND_MISSING:-0} == 1 ]]; then
+        info "проверку REALITY пропускаю: инбаунда ещё нет"
+    else
+        code=$(_http_code "$DECOY_DOMAIN" "/")
+        if [[ $code == 200 ]]; then ok "прикрытие через REALITY-fallback отвечает 200"
+        else err "https://${DECOY_DOMAIN}/ вернул $code (REALITY не отдал соединение на :${DECOY_HTTPS_PORT})"; rc=1; fi
+    fi
+
+    if [[ ${NX_INBOUND_MISSING:-0} == 1 ]]; then
+        info "проверку сертификата на decoy-SNI пропускаю: соединение идёт через REALITY"
+        return $rc
+    fi
 
     issuer=$(echo | openssl s_client -connect "${BIND_IP}:${PUBLIC_PORT}" \
                 -servername "$DECOY_DOMAIN" 2>/dev/null \
@@ -315,7 +307,7 @@ do_verify() {
 
 print_summary() {
     local inb
-    inb=$(inbound_find "$INBOUND_REMARK") || true
+    inb=$(inbound_find "$INBOUND_REMARK")
 
     printf '\n%s================ ГОТОВО ================%s\n' "$C_GRN" "$C_OFF"
     printf '  Панель      https://%s%s\n' "$PANEL_DOMAIN" "$PANEL_BASE_PATH"
@@ -323,14 +315,17 @@ print_summary() {
     printf '  Прикрытие   https://%s/   (%s)\n' "$DECOY_DOMAIN" "$(state_get DECOY_BRAND)"
     printf '  Сертификаты\n'
     certs_report "$PANEL_DOMAIN" "$DECOY_DOMAIN"
-    [[ $STAGING == 1 ]] && printf '  %sСертификаты тестовые (--staging). Перезапустите без флага для боевых.%s\n' "$C_YEL" "$C_OFF"
+    [[ $STAGING == 1 ]] && printf '  %sСертификаты тестовые (--staging). Перезапустите с --no-staging для боевых.%s\n' "$C_YEL" "$C_OFF"
     printf '  Конфиг      %s\n  Состояние   %s\n' "$NX_CONF" "$NX_STATE"
 
-    if [[ -n $inb ]]; then
-        printf '\n  Ссылки:\n'
-        inbound_print_links "$inb"
+    if [[ ${NX_INBOUND_MISSING:-0} == 1 || ${NX_INBOUND_BROKEN:-0} == 1 || -z $inb ]]; then
+        print_inbound_instructions
+        return 0
     fi
-    printf '\n  Добавить пользователя:  %s add-user <имя>\n' "$NX_SELF"
+
+    printf '\n  Ссылки:\n'
+    inbound_print_links "$inb"
+    printf '\n  Новых клиентов добавляйте в панели, затем:  nxrev links\n'
 }
 
 # --- прочие команды --------------------------------------------------------
@@ -357,30 +352,12 @@ cmd_status() {
 
 cmd_links() {
     _need_installed
-    panel_auth
     local inb
     inb=$(inbound_find "$INBOUND_REMARK")
     [[ -n $inb ]] || die "инбаунд '$INBOUND_REMARK' не найден"
     inbound_print_links "$inb"
 }
 
-cmd_add_user() {
-    local email=${1:-}
-    [[ -n $email ]] || die "укажите имя пользователя: $NX_SELF add-user <имя>"
-    _need_installed
-    panel_auth
-    local inb cid
-    inb=$(inbound_find "$INBOUND_REMARK")
-    [[ -n $inb ]] || die "инбаунд '$INBOUND_REMARK' не найден"
-    cid=$(inbound_add_client "$inb" "$email")
-    ok "клиент '$email' добавлен ($cid)"
-    inb=$(inbound_find "$INBOUND_REMARK")
-    # grep без совпадений уронил бы pipefail — но такого быть не должно
-    inbound_links "$inb" | { grep -F -- "$cid" || true; } | while IFS= read -r l; do
-        printf '\n%s\n' "$l"
-        if have qrencode; then qrencode -t ANSIUTF8 -m 1 "$l" || true; fi
-    done
-}
 
 cmd_regen_decoy() {
     _need_installed
@@ -399,7 +376,6 @@ main() {
         install)      parse_args "$@"; cmd_install ;;
         status)       parse_args "$@"; cmd_status ;;
         links)        parse_args "$@"; cmd_links ;;
-        add-user)     cmd_add_user "${1:-}" ;;
         regen-decoy)  parse_args "$@"; cmd_regen_decoy ;;
         -h|--help|help) usage ;;
         *) usage; die "неизвестная команда: $cmd" ;;
