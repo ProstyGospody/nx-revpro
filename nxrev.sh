@@ -170,6 +170,10 @@ cmd_install() {
     step "Привожу панель к работе за nginx"
     panel_apply_settings "$PANEL_DOMAIN"
 
+    # Пишем конфиг сразу: если дальше что-то упадёт, в нём уже есть куда
+    # положить PANEL_USER/PANEL_PASS для повторного запуска.
+    save_conf
+
     step "Доступ к API панели"
     panel_auth
 

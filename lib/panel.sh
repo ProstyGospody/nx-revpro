@@ -159,36 +159,84 @@ panel_load_credentials() {
 
 panel_base_url() { printf 'http://127.0.0.1:%s%s' "$PANEL_WEB_PORT" "$PANEL_BASE_PATH"; }
 
+# Подсказка, общая для всех случаев «панель не пустила».
+_auth_hints() {
+    err "install-result.env устаревает, если логин или пароль меняли в UI."
+    err "Пропишите актуальные и запустите install заново:"
+    err "    echo 'PANEL_USER=логин'  >> $NX_CONF"
+    err "    echo 'PANEL_PASS=пароль' >> $NX_CONF"
+    err "Панель сейчас слушает только loopback. Достучаться до неё можно туннелем:"
+    err "    ssh -L ${PANEL_WEB_PORT}:127.0.0.1:${PANEL_WEB_PORT} root@<ip-сервера>"
+    err "    затем http://127.0.0.1:${PANEL_WEB_PORT}${PANEL_BASE_PATH}"
+}
+
+# POST формы с возвратом HTTP-кода. Без -f: код и тело нужны для диагностики,
+# а -f их как раз и прячет.
+_post_form() {
+    local url=$1 out=$2; shift 2
+    curl -sS -o "$out" -w '%{http_code}' --max-time 15 "$@" "$url" 2>/dev/null || printf '000'
+}
+
 # Подбирает рабочий способ аутентификации: PANEL_AUTH = token | cookie.
 panel_auth() {
     panel_load_credentials
     mkdir -p "$NX_RUN"; chmod 700 "$NX_RUN"
+    local base; base=$(panel_base_url)
 
     if [[ -n ${PANEL_TOKEN:-} ]]; then
         if curl -fsS -o /dev/null --max-time 8 \
              -H "Authorization: Bearer $PANEL_TOKEN" \
-             "$(panel_base_url)panel/api/inbounds/list" 2>/dev/null; then
+             "${base}panel/api/inbounds/list" 2>/dev/null; then
             PANEL_AUTH=token; ok "API: токен из $(basename "$XUI_ENV")"; return 0
         fi
-        warn "токен из $XUI_ENV не подошёл — пробую логин/пароль"
+        warn "токен из $XUI_ENV не подошёл — пробую логин и пароль"
     fi
 
-    [[ -n ${PANEL_USER:-} && -n ${PANEL_PASS:-} ]] \
-        || die "нет доступа к API. Задайте PANEL_USER/PANEL_PASS (или PANEL_TOKEN) в $NX_CONF"
+    if [[ -z ${PANEL_USER:-} || -z ${PANEL_PASS:-} ]]; then
+        err "в $XUI_ENV не нашлось ни токена, ни пары логин/пароль"
+        _auth_hints
+        die "нет доступа к API панели"
+    fi
 
     rm -f "$NX_COOKIE"
-    local body
-    local -a args=(-fsS --max-time 10 -c "$NX_COOKIE"
+    local out="$NX_RUN/login.out" code body
+    local -a args=(-c "$NX_COOKIE"
                    --data-urlencode "username=$PANEL_USER"
                    --data-urlencode "password=$PANEL_PASS")
     [[ -n ${PANEL_SECRET:-} ]] && args+=(--data-urlencode "loginSecret=$PANEL_SECRET")
-    body=$(curl "${args[@]}" "$(panel_base_url)login" 2>/dev/null) \
-        || die "не смог залогиниться в панель на $(panel_base_url)"
-    [[ $(jq -r '.success // false' <<<"$body" 2>/dev/null) == true ]] \
-        || die "панель отклонила логин: $(jq -r '.msg // .' <<<"$body" 2>/dev/null)"
-    chmod 600 "$NX_COOKIE"
-    PANEL_AUTH=cookie
-    ok "API: сессия под пользователем $PANEL_USER"
+
+    code=$(_post_form "${base}login" "$out" "${args[@]}")
+    body=$(head -c 400 "$out" 2>/dev/null || true)
+    rm -f "$out"
+
+    case $code in
+        200|204)
+            if [[ $(jq -r '.success // false' <<<"$body" 2>/dev/null) == true ]]; then
+                chmod 600 "$NX_COOKIE"
+                PANEL_AUTH=cookie
+                ok "API: сессия под пользователем $PANEL_USER"
+                return 0
+            fi
+            err "панель ответила 200, но логин отклонён: $(jq -r '.msg // .' <<<"$body" 2>/dev/null || printf '%s' "$body")"
+            [[ -n ${PANEL_SECRET:-} ]] && err "в настройках задан secret — он отправлен как loginSecret"
+            _auth_hints ;;
+        401|403)
+            err "панель ответила $code — логин или пароль не подошли"
+            _auth_hints ;;
+        404)
+            err "панель ответила 404 на ${base}login"
+            err "не сходится webBasePath. Что реально лежит в БД:"
+            err "    sqlite3 $XUI_DB \"select value from settings where key='webBasePath'\"" ;;
+        000)
+            err "панель не ответила на ${base}login"
+            err "    systemctl status $XUI_SERVICE --no-pager"
+            err "    ss -lntp | grep ${PANEL_WEB_PORT}" ;;
+        *)
+            err "панель ответила $code на ${base}login"
+            [[ -n $body ]] && err "тело ответа: $body"
+            _auth_hints ;;
+    esac
+    die "не удалось получить доступ к API панели"
 }
 
 # api <GET|POST> <путь относительно base> [json-тело]
