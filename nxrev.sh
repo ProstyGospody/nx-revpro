@@ -260,9 +260,12 @@ wait_listen() {
 _listening() { ss -lntH 2>/dev/null | awk -v a="$1:$2" '$4 == a { f = 1 } END { exit !f }'; }
 
 _http_code() {
-    local host=$1 path=$2
-    curl -sk -o /dev/null -w '%{http_code}' --max-time 10 \
-        --resolve "${host}:${PUBLIC_PORT}:${BIND_IP}" "https://${host}:${PUBLIC_PORT}${path}" 2>/dev/null || echo 000
+    local host=$1 path=$2 code
+    # без "|| echo 000": curl уже печатает 000 при ошибке, приписка склеивала "000000"
+    code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 \
+           --resolve "${host}:${PUBLIC_PORT}:${BIND_IP}" \
+           "https://${host}:${PUBLIC_PORT}${path}" 2>/dev/null) || code=000
+    printf '%s' "${code:-000}"
 }
 
 do_verify() {
