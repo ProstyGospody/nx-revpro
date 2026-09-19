@@ -41,6 +41,10 @@ DECOY_HTTPS_PORT=9443
 INBOUND_REMARK="nx-reality"
 FIRST_CLIENT="owner"
 
+NX_CONF_TOKEN=""
+NX_CONF_USER=""
+NX_CONF_PASS=""
+
 NX_HTTP2_LISTEN=""
 NX_HTTP2_DIRECTIVE=""
 
@@ -76,6 +80,10 @@ load_conf() {
     [[ -r $NX_CONF ]] || return 0
     # shellcheck disable=SC1090
     . "$NX_CONF"
+    # Запоминаем ровно то, что задал человек: только это уйдёт обратно в файл.
+    NX_CONF_TOKEN=${PANEL_TOKEN:-}
+    NX_CONF_USER=${PANEL_USER:-}
+    NX_CONF_PASS=${PANEL_PASS:-}
 }
 
 save_conf() {
@@ -97,10 +105,13 @@ XRAY_PORT=$XRAY_PORT
 PANEL_HTTPS_PORT=$PANEL_HTTPS_PORT
 DECOY_HTTPS_PORT=$DECOY_HTTPS_PORT
 
-# Доступ к API панели. Пусто — берётся токен/логин из $XUI_ENV.
-PANEL_TOKEN="${PANEL_TOKEN:-}"
-PANEL_USER="${PANEL_USER:-}"
-PANEL_PASS="${PANEL_PASS:-}"
+# Доступ к API панели. Если пусто — логин и пароль читаются из таблицы users
+# в $XUI_DB, а при неудаче из $XUI_ENV. Заполняйте, только если нужен свой.
+# Заданное здесь перекрывает БД, поэтому устаревшее значение тут вреднее,
+# чем пустая строка.
+PANEL_TOKEN="$NX_CONF_TOKEN"
+PANEL_USER="$NX_CONF_USER"
+PANEL_PASS="$NX_CONF_PASS"
 CONF
     )
     chmod 600 "$NX_CONF"

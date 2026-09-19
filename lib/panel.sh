@@ -198,6 +198,7 @@ panel_load_credentials() {
     NX_PASS_HASHED=0
 
     if [[ -n $PANEL_TOKEN || ( -n $PANEL_USER && -n $PANEL_PASS ) ]]; then
+        NX_CREDS_SRC="$NX_CONF"
         info "учётные данные: заданы в $NX_CONF"
         return 0
     fi
@@ -205,13 +206,15 @@ panel_load_credentials() {
     local rc=0
     _creds_from_db || rc=$?
     case $rc in
-        0) info "учётные данные: из БД панели, пользователь '$PANEL_USER'"; return 0 ;;
+        0) NX_CREDS_SRC="БД панели"
+           info "учётные данные: из БД панели, пользователь '$PANEL_USER'"; return 0 ;;
         2) warn "пароль в БД хранится хешем — исходный из него не восстановить" ;;
     esac
 
     # При хешированном пароле сам пароль не менялся, только способ хранения,
     # поэтому значение из install-result.env ещё может подойти.
     if _creds_from_env; then
+        NX_CREDS_SRC=$(basename "$XUI_ENV")
         if (( NX_PASS_HASHED )); then
             info "учётные данные: из $(basename "$XUI_ENV") (проверить по БД нельзя)"
         else
@@ -228,11 +231,9 @@ panel_base_url() { printf 'http://127.0.0.1:%s%s' "$PANEL_WEB_PORT" "$PANEL_BASE
 # Подсказка, общая для всех случаев «панель не пустила».
 _auth_probe() {
     err ""
+    err "Источник учётных данных: ${NX_CREDS_SRC:-неизвестен}. Панель их не приняла."
     if (( ${NX_PASS_HASHED:-0} )); then
-        err "Пароль в БД хранится хешем, поэтому он взят из $(basename "$XUI_ENV")"
-        err "и, судя по всему, устарел."
-    else
-        err "Логин и пароль взяты из БД панели, но она их не приняла."
+        err "Пароль в БД хранится хешем, восстановить его оттуда нельзя."
     fi
     err ""
     err "Что посмотреть:"
@@ -319,7 +320,9 @@ _csrf_from_cookie() {
     raw=$(awk -F'\t' 'NF >= 7 && $6 ~ /^(3x-ui|x-ui|session)$/ { print $7 }' \
           "$NX_COOKIE" 2>/dev/null | tail -1)
     [[ -n $raw ]] || return 1
-    outer=$(_b64url_d "$raw")
+    # За вторым разделителем идёт бинарный hmac: вырезаем нули, иначе
+    # подстановка команды ругается на null-байты. Нужные части — ASCII.
+    outer=$(_b64url_d "$raw" | tr -d '\000')
     [[ $outer == *"|"* ]] || return 1
     mid=$(cut -d'|' -f2 <<<"$outer")
     [[ -n $mid ]] || return 1
@@ -382,6 +385,48 @@ _ensure_panel_alive() {
     return 1
 }
 
+# Перебор попыток логина для текущих PANEL_USER/PANEL_PASS.
+# Результат последней попытки остаётся в NX_HTTP_CODE и NX_LOGIN_BODY.
+_login_attempts() {
+    local out="$NX_RUN/login.out" field used
+    local -a variants
+
+    # Если secret-токен задан, перебираем имена поля: разные сборки 3x-ui ждут
+    # его как loginSecret или как secret. Последняя попытка — вовсе без него.
+    if [[ -n ${PANEL_SECRET:-} ]]; then
+        variants=(loginSecret secret "")
+    else
+        variants=("")
+    fi
+
+    NX_HTTP_CODE=000
+    NX_LOGIN_BODY=""
+
+    for field in "${variants[@]}"; do
+        _try_login "$field" "$out"
+        NX_LOGIN_BODY=$(head -c 400 "$out" 2>/dev/null || true)
+        used=${field:-без secret}
+
+        if [[ $NX_HTTP_CODE == 200 || $NX_HTTP_CODE == 204 ]] \
+           && [[ $(jq -r '.success // false' <<<"$NX_LOGIN_BODY" 2>/dev/null) == true ]]; then
+            rm -f "$out"
+            chmod 600 "$NX_COOKIE"
+            PANEL_AUTH=cookie
+            # после входа сессия пересоздаётся — токен берём заново
+            NX_CSRF=$(_csrf_from_cookie || true)
+            ok "API: вход выполнен, пользователь '$PANEL_USER' (secret как '$used')"
+            return 0
+        fi
+
+        info "попытка '$used' -> HTTP $NX_HTTP_CODE"
+        # Панель не отвечает вовсе — перебирать поля бессмысленно.
+        [[ $NX_HTTP_CODE == 000 ]] && break
+    done
+
+    rm -f "$out"
+    return 1
+}
+
 panel_auth() {
     panel_load_credentials
     mkdir -p "$NX_RUN"; chmod 700 "$NX_RUN"
@@ -392,50 +437,38 @@ panel_auth() {
         if curl -fsS -o /dev/null --max-time 8 \
              -H "Authorization: Bearer $PANEL_TOKEN" \
              "${base}panel/api/inbounds/list" 2>/dev/null; then
-            PANEL_AUTH=token; ok "API: токен из $(basename "$XUI_ENV")"; return 0
+            PANEL_AUTH=token; ok "API: доступ по токену"; return 0
         fi
-        warn "токен из $XUI_ENV не подошёл — пробую логин и пароль"
+        warn "токен не подошёл — пробую логин и пароль"
     fi
 
     if [[ -z ${PANEL_USER:-} || -z ${PANEL_PASS:-} ]]; then
-        err "в $XUI_ENV не нашлось ни токена, ни пары логин/пароль"
+        err "не нашлось ни токена, ни пары логин/пароль"
         _auth_probe
         die "нет доступа к API панели"
     fi
 
-    # Если secret-токен задан, перебираем имена поля: разные сборки 3x-ui ждут
-    # его как loginSecret или как secret. Последняя попытка — вовсе без него.
-    local out="$NX_RUN/login.out" code=000 body="" field="" used=""
-    local -a variants
-    if [[ -n ${PANEL_SECRET:-} ]]; then
-        variants=(loginSecret secret "")
-        info "в настройках панели задан secret-токен — отправляю его при логине"
-    else
-        variants=("")
+    [[ -n ${PANEL_SECRET:-} ]] && info "в настройках панели задан secret-токен — отправляю его при логине"
+
+    _login_attempts && return 0
+
+    # Конфиг и install-result.env устаревают одинаково: оба помнят пароль на
+    # момент записи. БД панели — единственный источник, который всегда актуален,
+    # поэтому при отказе даём ему второй шанс.
+    if [[ ${NX_CREDS_SRC:-} != "БД панели" ]]; then
+        local keep_user=$PANEL_USER keep_pass=$PANEL_PASS
+        PANEL_USER=""; PANEL_PASS=""
+        if _creds_from_db; then
+            if [[ $PANEL_USER != "$keep_user" || $PANEL_PASS != "$keep_pass" ]]; then
+                warn "данные из ${NX_CREDS_SRC:-первого источника} не подошли — пробую те, что в БД панели"
+                NX_CREDS_SRC="БД панели"
+                _login_attempts && return 0
+            fi
+        fi
+        [[ -n $PANEL_USER ]] || { PANEL_USER=$keep_user; PANEL_PASS=$keep_pass; }
     fi
 
-    for field in "${variants[@]}"; do
-        _try_login "$field" "$out"
-        code=$NX_HTTP_CODE
-        body=$(head -c 400 "$out" 2>/dev/null || true)
-        used=${field:-без secret}
-
-        if [[ $code == 200 || $code == 204 ]] \
-           && [[ $(jq -r '.success // false' <<<"$body" 2>/dev/null) == true ]]; then
-            rm -f "$out"
-            chmod 600 "$NX_COOKIE"
-            PANEL_AUTH=cookie
-            # после входа сессия пересоздаётся — токен берём заново
-            NX_CSRF=$(_csrf_from_cookie || true)
-            ok "API: сессия под пользователем $PANEL_USER (secret как '$used')"
-            return 0
-        fi
-
-        info "попытка '$used' -> HTTP $code"
-        # Панель не отвечает вовсе — перебирать поля бессмысленно.
-        [[ $code == 000 ]] && break
-    done
-    rm -f "$out"
+    local code=$NX_HTTP_CODE body=${NX_LOGIN_BODY:-}
 
     if [[ $code == 200 ]] && jq -e '.success == false' <<<"$body" >/dev/null 2>&1; then
         err "панель приняла запрос и отвергла учётные данные:"
@@ -452,15 +485,9 @@ panel_auth() {
             [[ -n ${NX_CURL_ERR:-} ]] && err "curl сказал: $NX_CURL_ERR"
             err "Это не про пароль. Проверьте, жива ли панель:"
             err "    systemctl status $XUI_SERVICE --no-pager"
-            err "    ss -lntp | grep ${PANEL_WEB_PORT}"
-            err "    curl -sS -o /dev/null -w '%{http_code}\n' -m 5 $(panel_base_url)"
-            err "Если корень отвечает, а login висит — панель могла забанить"
-            err "адрес после неудачных попыток: journalctl -u $XUI_SERVICE -n 50 --no-pager" ;;
+            err "    ss -lntp | grep ${PANEL_WEB_PORT}" ;;
         403)
             err "403 отдаёт не проверка пароля, а middleware панели."
-            _auth_probe ;;
-        401)
-            err "логин или пароль не подошли"
             _auth_probe ;;
         404)
             err "не сходится webBasePath. Что реально лежит в БД:"
