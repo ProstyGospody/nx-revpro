@@ -217,13 +217,40 @@ _panel_headers() {
 
 # Одна попытка логина. secret_field — под каким именем отправить secret-токен
 # (у разных сборок 3x-ui это loginSecret или secret), пусто — не отправлять.
-_try_login() {
-    local secret_field=$1 out=$2
+# Браузер перед логином сначала грузит страницу панели: получает сессионную
+# куку и CSRF-токен. Свежие 3x-ui без этого отдают на POST голый 403 с
+# Content-Length: 0 и ничего не пишут в журнал. Повторяем тот же порядок.
+_prime_session() {
+    local page="$NX_RUN/panel.html"
     rm -f "$NX_COOKIE"
     _panel_headers
-    local -a args=(-c "$NX_COOKIE" "${NX_HDR[@]}"
+    curl -sS -c "$NX_COOKIE" -o "$page" --max-time 10 \
+        "$(panel_base_url)" >/dev/null 2>&1 || true
+
+    # Токен ищем сначала в куке, затем в разметке страницы.
+    NX_CSRF=""
+    if [[ -s $NX_COOKIE ]]; then
+        NX_CSRF=$(awk '!/^#/ && NF >= 7 && tolower($6) ~ /csrf|xsrf/ { print $7 }' \
+                  "$NX_COOKIE" 2>/dev/null | tail -1)
+    fi
+    if [[ -z $NX_CSRF && -s $page ]]; then
+        NX_CSRF=$(grep -oiE '(csrf|xsrf)[a-z_-]*"?[^"]{0,20}"[^"]{8,}"' "$page" 2>/dev/null \
+                  | sed -n 's/.*"\([^"]\{8,\}\)"$/\1/p' | head -1)
+    fi
+    rm -f "$page"
+    [[ -n $NX_CSRF ]] && info "CSRF-токен получен со страницы панели"
+    return 0
+}
+
+# Одна попытка логина. secret_field — под каким именем отправить secret-токен
+# (у разных сборок 3x-ui это loginSecret или secret), пусто — не отправлять.
+_try_login() {
+    local secret_field=$1 out=$2
+    _prime_session
+    local -a args=(-b "$NX_COOKIE" -c "$NX_COOKIE" "${NX_HDR[@]}"
                    --data-urlencode "username=$PANEL_USER"
                    --data-urlencode "password=$PANEL_PASS")
+    [[ -n ${NX_CSRF:-} ]] && args+=(-H "X-CSRF-Token: $NX_CSRF" -H "X-XSRF-TOKEN: $NX_CSRF")
     [[ -n $secret_field && -n ${PANEL_SECRET:-} ]] \
         && args+=(--data-urlencode "${secret_field}=$PANEL_SECRET")
     _post_form "$(panel_base_url)login" "$out" "${args[@]}"
