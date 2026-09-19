@@ -22,13 +22,25 @@ inbound_find_by_port() {
     inbound_list | jq -c --argjson p "$1" 'map(select(.port == $p)) | first // empty'
 }
 
+# tgId у 3x-ui менял тип: до 3.8 это была строка, сейчас int64. Версию по
+# API не спросить, поэтому обе формы перебираются на месте — панель сама
+# скажет, какая ей подходит.
+NX_TGID_FORMS=('0' '""')
+
+# _build_client <uuid> <email> <subId> [json-значение tgId]
 _build_client() {
-    jq -n --arg id "$1" --arg email "$2" --arg subid "$3" \
+    jq -n --arg id "$1" --arg email "$2" --arg subid "$3" --argjson tg "${4:-0}" \
         '{id:$id, flow:"xtls-rprx-vision", email:$email, limitIp:0, totalGB:0,
-          expiryTime:0, enable:true, tgId:"", subId:$subid, reset:0}'
+          expiryTime:0, enable:true, tgId:$tg, subId:$subid, reset:0}'
+}
+
+# Ошибка именно про тип tgId, а не что-то другое.
+_is_tgid_type_error() {
+    grep -qi 'tgId' <<<"$1" && grep -qi 'unmarshal\|cannot.*type' <<<"$1"
 }
 
 # inbound_create <email> — создаёт инбаунд, печатает id клиента.
+# inbound_create <email> — создаёт инбаунд, печатает uuid клиента.
 inbound_create() {
     local email=$1
     local priv pub sid1 sid2 sid3 cid subid
@@ -36,10 +48,7 @@ inbound_create() {
     sid1=$(rand_hex 8); sid2=$(rand_hex 6); sid3=$(rand_hex 4)
     cid=$(uuid); subid=$(rand_alnum 16)
 
-    local client settings stream sniff alloc payload resp
-    client=$(_build_client "$cid" "$email" "$subid")
-    settings=$(jq -n --argjson c "$client" '{clients:[$c], decryption:"none", fallbacks:[]}')
-
+    local stream sniff alloc
     stream=$(jq -n \
         --arg dest "127.0.0.1:${DECOY_HTTPS_PORT}" \
         --arg sni  "$DECOY_DOMAIN" \
@@ -69,36 +78,59 @@ inbound_create() {
     sniff=$(jq -n '{enabled:true, destOverride:["http","tls","quic"], metadataOnly:false, routeOnly:false}')
     alloc=$(jq -n '{strategy:"always", refresh:5, concurrency:3}')
 
-    payload=$(jq -n \
-        --arg remark "$INBOUND_REMARK" \
-        --argjson port "$XRAY_PORT" \
-        --arg settings "$settings" --arg strm "$stream" \
-        --arg sniff "$sniff" --arg alloc "$alloc" '
-        {up:0, down:0, total:0, remark:$remark, enable:true, expiryTime:0,
-         listen:"127.0.0.1", port:$port, protocol:"vless",
-         settings:$settings, streamSettings:$strm, sniffing:$sniff, allocate:$alloc}')
+    local tg settings payload resp msg=""
+    for tg in "${NX_TGID_FORMS[@]}"; do
+        settings=$(jq -n --argjson c "$(_build_client "$cid" "$email" "$subid" "$tg")" \
+                   '{clients:[$c], decryption:"none", fallbacks:[]}')
+        payload=$(jq -n \
+            --arg remark "$INBOUND_REMARK" \
+            --argjson port "$XRAY_PORT" \
+            --arg settings "$settings" --arg strm "$stream" \
+            --arg sniff "$sniff" --arg alloc "$alloc" '
+            {up:0, down:0, total:0, remark:$remark, enable:true, expiryTime:0,
+             listen:"127.0.0.1", port:$port, protocol:"vless",
+             settings:$settings, streamSettings:$strm, sniffing:$sniff, allocate:$alloc}')
 
-    resp=$(api POST panel/api/inbounds/add "$payload") \
-        || die "запрос inbounds/add не прошёл"
-    api_ok "$resp" || die "панель отказалась создавать инбаунд: $(jq -r '.msg // .' <<<"$resp")"
+        resp=$(api POST panel/api/inbounds/add "$payload") || die "запрос inbounds/add не прошёл"
+        if api_ok "$resp"; then
+            state_set REALITY_PRIVATE_KEY "$priv"
+            state_set REALITY_PUBLIC_KEY  "$pub"
+            ok "инбаунд '$INBOUND_REMARK' создан: vless+reality на 127.0.0.1:${XRAY_PORT}"
+            printf '%s' "$cid"
+            return 0
+        fi
 
-    state_set REALITY_PRIVATE_KEY "$priv"
-    state_set REALITY_PUBLIC_KEY  "$pub"
-    ok "инбаунд '$INBOUND_REMARK' создан: vless+reality на 127.0.0.1:${XRAY_PORT}"
-    printf '%s' "$cid"
+        msg=$(jq -r '.msg // .' <<<"$resp")
+        if _is_tgid_type_error "$msg"; then
+            info "панель ждёт другой тип tgId — повторяю"
+            continue
+        fi
+        break
+    done
+
+    die "панель отказалась создавать инбаунд: $msg"
 }
 
 # inbound_add_client <inbound_json> <email> — печатает uuid нового клиента.
+# inbound_add_client <inbound_json> <email> — печатает uuid нового клиента.
 inbound_add_client() {
-    local inb=$1 email=$2 id cid subid resp settings
+    local inb=$1 email=$2 id cid subid tg resp settings msg=""
     id=$(jq -r '.id' <<<"$inb")
     cid=$(uuid); subid=$(rand_alnum 16)
-    settings=$(jq -n --argjson c "$(_build_client "$cid" "$email" "$subid")" '{clients:[$c]}')
-    resp=$(api POST panel/api/inbounds/addClient \
-             "$(jq -n --argjson id "$id" --arg s "$settings" '{id:$id, settings:$s}')") \
-        || die "запрос addClient не прошёл"
-    api_ok "$resp" || die "панель отказалась добавить клиента: $(jq -r '.msg // .' <<<"$resp")"
-    printf '%s' "$cid"
+
+    for tg in "${NX_TGID_FORMS[@]}"; do
+        settings=$(jq -n --argjson c "$(_build_client "$cid" "$email" "$subid" "$tg")" '{clients:[$c]}')
+        resp=$(api POST panel/api/inbounds/addClient \
+                 "$(jq -n --argjson id "$id" --arg s "$settings" '{id:$id, settings:$s}')") \
+            || die "запрос addClient не прошёл"
+        api_ok "$resp" && { printf '%s' "$cid"; return 0; }
+
+        msg=$(jq -r '.msg // .' <<<"$resp")
+        _is_tgid_type_error "$msg" && continue
+        break
+    done
+
+    die "панель отказалась добавить клиента: $msg"
 }
 
 # inbound_links <inbound_json> — по строке vless:// на каждого клиента.
