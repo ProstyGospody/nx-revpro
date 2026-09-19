@@ -201,17 +201,23 @@ _auth_probe() {
 # а -f их как раз и прячет. Код забираем в переменную, а не дописываем запасной
 # через ||: curl при ошибке уже напечатал "000", и получалось "000000".
 # stderr curl сохраняем — при коде 000 только там и написано, что случилось.
+# POST формы. Результат кладётся в глобальные NX_HTTP_CODE / NX_CURL_RC /
+# NX_CURL_ERR, а не печатается: вызов через $( ) уводил бы всё в подоболочку,
+# и наружу не попадала даже причина ошибки.
+# Без -f — код и тело нужны для диагностики, а -f их прячет.
 _post_form() {
     local url=$1 out=$2; shift 2
-    local errf="$NX_RUN/curl.err" code
-    if code=$(curl -sS -o "$out" -w '%{http_code}' --max-time 15 "$@" "$url" 2>"$errf"); then
+    local errf="$NX_RUN/curl.err"
+
+    : > "$errf" 2>/dev/null || errf=/dev/null
+    if NX_HTTP_CODE=$(curl -sS -o "$out" -w '%{http_code}' --max-time 15 "$@" "$url" 2>"$errf"); then
         NX_CURL_RC=0
     else
         NX_CURL_RC=$?
     fi
     NX_CURL_ERR=$(tr -d '\r' < "$errf" 2>/dev/null | head -c 200 || true)
-    rm -f "$errf"
-    printf '%s' "${code:-000}"
+    [[ $errf != /dev/null ]] && rm -f "$errf"
+    NX_HTTP_CODE=${NX_HTTP_CODE:-000}
 }
 
 # Одна попытка логина. secret_field — под каким именем отправить secret-токен
@@ -263,15 +269,23 @@ _csrf_from_cookie() {
 # CSRF-токеном. Свежие 3x-ui без него отдают на POST голый 403 с
 # Content-Length: 0 и ничего не пишут в журнал. Повторяем тот же порядок.
 _prime_session() {
+    local gcode
     rm -f "$NX_COOKIE"
     _panel_headers
-    curl -sS -c "$NX_COOKIE" -o /dev/null --max-time 10 \
-        "$(panel_base_url)" >/dev/null 2>&1 || true
+    gcode=$(curl -sS -c "$NX_COOKIE" -o /dev/null -w '%{http_code}' --max-time 10 \
+            "$(panel_base_url)" 2>/dev/null) || gcode=000
+    info "страница панели: HTTP ${gcode:-000}"
+
     NX_CSRF=$(_csrf_from_cookie || true)
     if [[ -n ${NX_CSRF:-} ]]; then
         info "CSRF-токен получен из сессионной куки"
     else
-        warn "CSRF-токен не нашёлся в куке — если будет 403, дело в нём"
+        warn "CSRF-токен не нашёлся в куке"
+        if [[ ! -s $NX_COOKIE ]]; then
+            warn "  файл кук $NX_COOKIE пуст: GET страницы панели не отдал Set-Cookie"
+        else
+            warn "  куки в jar: $(awk 'NF >= 7 { printf "%s ", $6 }' "$NX_COOKIE")"
+        fi
     fi
     return 0
 }
@@ -324,7 +338,8 @@ panel_auth() {
     fi
 
     for field in "${variants[@]}"; do
-        code=$(_try_login "$field" "$out")
+        _try_login "$field" "$out"
+        code=$NX_HTTP_CODE
         body=$(head -c 400 "$out" 2>/dev/null || true)
         used=${field:-без secret}
 
