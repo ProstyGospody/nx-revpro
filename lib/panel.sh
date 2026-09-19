@@ -103,11 +103,17 @@ panel_apply_settings() {
     systemctl start "$XUI_SERVICE" || die "не смог запустить $XUI_SERVICE"
     panel_wait_up || die "панель не поднялась на 127.0.0.1:${PANEL_WEB_PORT}"
 
+    case ${PANEL_ROOT_CODE:-000} in
+        200|301|302|307|308) ;;
+        *) warn "корень панели отвечает $PANEL_ROOT_CODE — до проверки пароля дело ещё не дошло, а панель уже отказывает" ;;
+    esac
+
     # Читаем обратно: 3x-ui умеет ронять subPath в "/" и терять webListen.
     local before_sub=$PANEL_SUB_PATH before_base=$PANEL_BASE_PATH bad=0
     panel_read_settings
     [[ $PANEL_WEB_LISTEN == "127.0.0.1" ]] || { err "webListen не сохранился: '$PANEL_WEB_LISTEN'"; bad=1; }
     [[ -z $PANEL_WEB_CERT && -z $PANEL_WEB_KEY ]] || { err "webCertFile/webKeyFile не очистились"; bad=1; }
+    [[ -z $PANEL_WEB_DOMAIN ]] || { err "webDomain не очистился: '$PANEL_WEB_DOMAIN' — панель будет отбивать 127.0.0.1 кодом 403"; bad=1; }
     [[ $PANEL_SUB_PATH == "$before_sub" ]] || { err "subPath уехал: '$before_sub' -> '$PANEL_SUB_PATH'"; bad=1; }
     [[ $PANEL_BASE_PATH == "$before_base" ]] || { err "webBasePath уехал: '$before_base' -> '$PANEL_BASE_PATH'"; bad=1; }
     (( bad == 0 )) || die "настройки панели не применились; исходная БД лежит в $bak"
@@ -116,14 +122,19 @@ panel_apply_settings() {
     ok "подписка: 127.0.0.1:${PANEL_SUB_PORT}${PANEL_SUB_PATH}"
 }
 
+# Ждёт, пока панель начнёт отвечать, и запоминает HTTP-код корня в
+# PANEL_ROOT_CODE. Раньше здесь был curl без -f: успехом считался любой ответ,
+# в том числе 403, и «панель поднялась» печаталось, когда она уже отбивала.
 panel_wait_up() {
-    local i
+    local i code=000
     for i in $(seq 1 30); do
-        curl -sS -o /dev/null --max-time 3 \
-            "http://127.0.0.1:${PANEL_WEB_PORT}${PANEL_BASE_PATH}" 2>/dev/null && return 0
+        code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 3 \
+               "$(panel_base_url)" 2>/dev/null || printf '000')
+        [[ $code != 000 ]] && break
         sleep 1
     done
-    return 1
+    PANEL_ROOT_CODE=$code
+    [[ $code != 000 ]]
 }
 
 # --- учётные данные --------------------------------------------------------
