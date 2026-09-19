@@ -287,22 +287,23 @@ nginx_test() {
 # Перезагрузка с проверкой результата. Раньше при неактивном nginx.service
 # скрипт просто делал `enable --now`, и если порт держал посторонний процесс,
 # запуск падал с bind: Address already in use — молча, в error.log.
+# Намеренно restart, а не reload. При reload nginx оставляет прежние сокеты и
+# прежний конфиг, если новый не смог забиндиться, — и `nginx -s reload` при
+# этом возвращает 0. Отличить такую ситуацию по сокетам невозможно: адреса
+# совпадают. Для установочного скрипта предсказуемость важнее, чем экономия
+# доли секунды простоя, поэтому конфиг применяется перезапуском.
 nginx_reload() {
     nginx_test
 
-    if systemctl is-active --quiet nginx; then
-        systemctl reload nginx || die "nginx reload не удался"
-    else
-        if ! systemctl enable --now nginx 2>/dev/null; then
-            err "nginx.service не запустился. Последние строки error.log:"
-            tail -n 5 /var/log/nginx/error.log 2>/dev/null | sed 's/^/      /' >&2 || true
-            die "nginx не стартует"
-        fi
+    if ! systemctl restart nginx 2>/dev/null; then
+        err "nginx не перезапустился. Последние строки error.log:"
+        tail -n 8 /var/log/nginx/error.log 2>/dev/null | sed 's/^/      /' >&2 || true
+        die "nginx не стартует"
     fi
+    systemctl enable --quiet nginx 2>/dev/null || true
 
-    systemctl is-active --quiet nginx \
-        || die "nginx.service не активен после перезагрузки конфигов"
-    ok "nginx перезагружен"
+    systemctl is-active --quiet nginx || die "nginx.service не активен после перезапуска"
+    ok "nginx перезапущен с новыми конфигами"
 }
 
 # Фаза 1: только :80, 443 ещё свободен для certbot и для того, чтобы не
@@ -333,9 +334,9 @@ nginx_phase_full() {
     nginx_ensure_listening "0.0.0.0 80" "$BIND_IP 443" "127.0.0.1 $PANEL_HTTPS_PORT" "127.0.0.1 $DECOY_HTTPS_PORT"
 }
 
-# nginx -t проверяет синтаксис файла, но не то, что файл вообще включён:
-# если в nginx.conf нет include conf.d/*.conf, наши server-блоки просто
-# не существуют для работающего процесса, а ошибок при этом нет.
+# Проверяет, что nginx.conf вообще включает наши файлы: без include
+# conf.d/*.conf они просто не существуют для nginx, и ошибок при этом нет.
+# Это проверка диска, не памяти процесса — применение гарантирует restart.
 nginx_assert_loaded() {
     local live
     live=$(nginx -T 2>/dev/null) || die "nginx -T не отработал"
@@ -345,7 +346,7 @@ nginx_assert_loaded() {
         err "    include ${NX_NGINX_CONFD}/*.conf;"
         die "конфиги nx-revpro не загружены"
     fi
-    ok "конфиги nx-revpro загружены в nginx"
+    ok "конфиги nx-revpro на месте и синтаксически верны"
 }
 
 # reload не перепривязывает сокеты: старые воркеры держат прежние адреса, и
