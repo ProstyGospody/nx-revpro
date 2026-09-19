@@ -95,3 +95,41 @@ certs_report() {
         fi
     done
 }
+
+# Проверка webroot до обращения к CA. Certbot на такой ошибке тратит попытку из
+# недельного лимита, а сообщение даёт довольно глухое: кладём свой файл и
+# смотрим, доезжает ли он через тот же путь, которым пойдёт валидация.
+certs_selftest() {
+    local domain=$1 token path code body
+    token="nx-probe-$(rand_hex 12)"
+    path="$NX_ACME_ROOT/.well-known/acme-challenge/$token"
+
+    mkdir -p "$(dirname "$path")"
+    printf '%s' "$token" > "$path"
+    chmod 644 "$path"
+
+    body=$(curl -sS --max-time 10 \
+           --resolve "${domain}:80:${BIND_IP}" \
+           "http://${domain}/.well-known/acme-challenge/${token}" 2>/dev/null) || body=""
+    code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 \
+           --resolve "${domain}:80:${BIND_IP}" \
+           "http://${domain}/.well-known/acme-challenge/${token}" 2>/dev/null) || code=000
+    rm -f "$path"
+
+    if [[ $body == "$token" ]]; then
+        ok "webroot для $domain отдаётся корректно"
+        return 0
+    fi
+
+    err "проверка webroot для $domain не прошла: HTTP $code"
+    err "по http://${domain}/.well-known/acme-challenge/... приходит не наш файл,"
+    err "значит запрос обслуживает чужой server-блок, а не nx-revpro."
+    err ""
+    err "Кто ещё объявляет этот домен:"
+    err "    grep -rn 'server_name' /etc/nginx/sites-enabled/ /etc/nginx/conf.d/"
+    err "Что реально загружено в nginx:"
+    err "    nginx -T | grep -nE 'server_name|listen '"
+    err ""
+    err "Уберите или переименуйте чужой блок для $domain и запустите install заново."
+    return 1
+}

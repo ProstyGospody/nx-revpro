@@ -197,6 +197,9 @@ cmd_install() {
     step "Сертификаты Let's Encrypt"
     [[ $STAGING == 1 ]] && warn "режим --staging: сертификаты не доверенные, для отладки"
     certs_install_hook
+    nginx_assert_loaded
+    certs_selftest "$PANEL_DOMAIN" || die "ACME-челлендж не доедет — сертификат не выпустить"
+    certs_selftest "$DECOY_DOMAIN" || die "ACME-челлендж не доедет — сертификат не выпустить"
     certs_issue "$PANEL_DOMAIN"
     certs_issue "$DECOY_DOMAIN"
     certs_check_timer

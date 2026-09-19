@@ -312,3 +312,18 @@ nginx_phase_full() {
     nginx_write_stream
     nginx_reload
 }
+
+# nginx -t проверяет синтаксис файла, но не то, что файл вообще включён:
+# если в nginx.conf нет include conf.d/*.conf, наши server-блоки просто
+# не существуют для работающего процесса, а ошибок при этом нет.
+nginx_assert_loaded() {
+    local live
+    live=$(nginx -T 2>/dev/null) || die "nginx -T не отработал"
+    if ! grep -q 'nx-revpro' <<<"$live"; then
+        err "работающий nginx не содержит конфигов nx-revpro"
+        err "скорее всего в $NX_NGINX_MAIN нет строки:"
+        err "    include ${NX_NGINX_CONFD}/*.conf;"
+        die "конфиги nx-revpro не загружены"
+    fi
+    ok "конфиги nx-revpro загружены в nginx"
+}
