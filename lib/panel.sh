@@ -160,12 +160,23 @@ panel_load_credentials() {
 panel_base_url() { printf 'http://127.0.0.1:%s%s' "$PANEL_WEB_PORT" "$PANEL_BASE_PATH"; }
 
 # Подсказка, общая для всех случаев «панель не пустила».
-_auth_hints() {
-    err "install-result.env устаревает, если логин или пароль меняли в UI."
-    err "Пропишите актуальные и запустите install заново:"
+_auth_probe() {
+    err ""
+    err "Что посмотреть:"
+    err "  1. Реальные учётные данные панели (3x-ui умеет их показать):"
+    err "       x-ui setting -show true"
+    err "  2. Включены ли secret-токен или второй фактор:"
+    err "       sqlite3 $XUI_DB \"select key, value from settings where key like '%secret%' or key like '%twoFactor%' or key = 'webDomain'\""
+    err "  3. Что панель записала о попытке входа:"
+    err "       journalctl -u $XUI_SERVICE -n 30 --no-pager"
+    err ""
+    err "Если пароль просто другой — впишите рабочий и запустите install заново:"
     err "    echo 'PANEL_USER=логин'  >> $NX_CONF"
     err "    echo 'PANEL_PASS=пароль' >> $NX_CONF"
-    err "Панель сейчас слушает только loopback. Достучаться до неё можно туннелем:"
+    err "Если включён второй фактор — его придётся выключить на время установки:"
+    err "скрипт ходит в API без участия человека и TOTP-код взять неоткуда."
+    err ""
+    err "Панель сейчас слушает только loopback. Открыть её можно туннелем:"
     err "    ssh -L ${PANEL_WEB_PORT}:127.0.0.1:${PANEL_WEB_PORT} root@<ip-сервера>"
     err "    затем http://127.0.0.1:${PANEL_WEB_PORT}${PANEL_BASE_PATH}"
 }
@@ -194,7 +205,7 @@ panel_auth() {
 
     if [[ -z ${PANEL_USER:-} || -z ${PANEL_PASS:-} ]]; then
         err "в $XUI_ENV не нашлось ни токена, ни пары логин/пароль"
-        _auth_hints
+        _auth_probe
         die "нет доступа к API панели"
     fi
 
@@ -209,32 +220,38 @@ panel_auth() {
     body=$(head -c 400 "$out" 2>/dev/null || true)
     rm -f "$out"
 
+    # Тело ответа печатаем всегда, кроме успеха: у 3x-ui именно в нём написано,
+    # что не понравилось — пароль, secret-токен или второй фактор.
+    if [[ $code == 200 || $code == 204 ]] \
+       && [[ $(jq -r '.success // false' <<<"$body" 2>/dev/null) == true ]]; then
+        chmod 600 "$NX_COOKIE"
+        PANEL_AUTH=cookie
+        ok "API: сессия под пользователем $PANEL_USER"
+        return 0
+    fi
+
+    err "панель ответила $code на ${base}login"
+    [[ -n $body ]] && err "тело ответа: $body"
+
     case $code in
-        200|204)
-            if [[ $(jq -r '.success // false' <<<"$body" 2>/dev/null) == true ]]; then
-                chmod 600 "$NX_COOKIE"
-                PANEL_AUTH=cookie
-                ok "API: сессия под пользователем $PANEL_USER"
-                return 0
-            fi
-            err "панель ответила 200, но логин отклонён: $(jq -r '.msg // .' <<<"$body" 2>/dev/null || printf '%s' "$body")"
-            [[ -n ${PANEL_SECRET:-} ]] && err "в настройках задан secret — он отправлен как loginSecret"
-            _auth_hints ;;
-        401|403)
-            err "панель ответила $code — логин или пароль не подошли"
-            _auth_hints ;;
+        403)
+            err "403 отдаёт не проверка пароля, а middleware панели. Обычно это"
+            err "secret-токен, включённый второй фактор или ограничение по Host."
+            _auth_probe ;;
+        401)
+            err "логин или пароль не подошли"
+            _auth_probe ;;
         404)
-            err "панель ответила 404 на ${base}login"
             err "не сходится webBasePath. Что реально лежит в БД:"
-            err "    sqlite3 $XUI_DB \"select value from settings where key='webBasePath'\"" ;;
+            err "    sqlite3 $XUI_DB \"select value from settings where key='webBasePath'\""
+            ;;
         000)
-            err "панель не ответила на ${base}login"
+            err "панель не ответила:"
             err "    systemctl status $XUI_SERVICE --no-pager"
-            err "    ss -lntp | grep ${PANEL_WEB_PORT}" ;;
+            err "    ss -lntp | grep ${PANEL_WEB_PORT}"
+            ;;
         *)
-            err "панель ответила $code на ${base}login"
-            [[ -n $body ]] && err "тело ответа: $body"
-            _auth_hints ;;
+            _auth_probe ;;
     esac
     die "не удалось получить доступ к API панели"
 }
