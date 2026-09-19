@@ -382,8 +382,14 @@ panel_auth() {
     done
     rm -f "$out"
 
-    err "панель не пустила: последний ответ HTTP $code на ${base}login"
-    [[ -n $body ]] && err "тело ответа: $body"
+    if [[ $code == 200 ]] && jq -e '.success == false' <<<"$body" >/dev/null 2>&1; then
+        err "панель приняла запрос и отвергла учётные данные:"
+        err "    $(jq -r '.msg // .' <<<"$body")"
+        err "Сессия и CSRF при этом работают — дело только в логине или пароле."
+    else
+        err "панель не пустила: последний ответ HTTP $code на ${base}login"
+        [[ -n $body ]] && err "тело ответа: $body"
+    fi
 
     case $code in
         000)
