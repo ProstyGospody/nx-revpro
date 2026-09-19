@@ -374,7 +374,7 @@ TPL
 decoy_generate() {
     local force=${1:-0}
     if [[ -s "$NX_DECOY_ROOT/index.html" && -n $(state_get DECOY_BRAND) && $force != 1 ]]; then
-        ok "прикрытие на месте: $(state_get DECOY_BRAND) [$(state_get DECOY_KIND)]"
+        okm decoy_kept "$(state_get DECOY_BRAND)" "$(state_get DECOY_KIND)"
         return 0
     fi
 
@@ -408,5 +408,5 @@ decoy_generate() {
 
     state_set DECOY_BRAND "$DK_BRAND"
     state_set DECOY_KIND  "$DK_KIND"
-    ok "сгенерировано прикрытие: $DK_BRAND [$DK_KIND], основано в $DK_YEAR"
+    okm decoy_made "$DK_BRAND" "$DK_KIND" "$DK_YEAR"
 }

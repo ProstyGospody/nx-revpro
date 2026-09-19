@@ -36,7 +36,7 @@ nginx_prepare() {
         local bak
         bak=$(backup_file /etc/nginx/sites-enabled/default)
         rm -f /etc/nginx/sites-enabled/default
-        warn "отключил /etc/nginx/sites-enabled/default (копия: $bak)"
+        warnm nginx_default_off "$bak"
     fi
 
     nginx_patch_main
@@ -45,13 +45,11 @@ nginx_prepare() {
 # Верхнеуровневый блок stream{} в nginx.conf: в Debian его там нет.
 nginx_patch_main() {
     if grep -q 'nx-revpro' "$NX_NGINX_MAIN"; then
-        ok "nginx.conf уже подключает stream-роутер"
+        okm nginx_main_ok
         return 0
     fi
     if grep -qE '^[[:space:]]*stream[[:space:]]*\{' "$NX_NGINX_MAIN"; then
-        die "в $NX_NGINX_MAIN уже есть блок stream{}. Добавьте внутрь него строку:
-        include ${NX_NGINX_STREAM_DIR}/*.conf;
-    и перезапустите скрипт."
+        diem nginx_stream_exists "$NX_NGINX_MAIN" "$NX_NGINX_STREAM_DIR"
     fi
     local bak
     bak=$(backup_file "$NX_NGINX_MAIN")
@@ -63,7 +61,7 @@ stream {
 }
 $NX_MARK_END
 PATCH
-    ok "в nginx.conf добавлен stream{} (копия: $bak)"
+    okm nginx_main_patched "$bak"
 }
 
 nginx_write_common() {
@@ -75,7 +73,7 @@ map $http_upgrade $nx_connection_upgrade {
     ''      close;
 }
 TPL
-    ok "$(basename "$NX_CONF_COMMON")"
+    okm nginx_wrote "$(basename "$NX_CONF_COMMON")"
 }
 
 # Фаза 1: только :80. Нужен, чтобы certbot прошёл webroot ДО того, как мы
@@ -104,7 +102,7 @@ server {
     }
 }
 TPL
-    ok "$(basename "$NX_CONF_ACME")"
+    okm nginx_wrote "$(basename "$NX_CONF_ACME")"
 }
 
 NX_PROXY_PARAMS=/etc/nginx/nx-revpro/proxy-params.conf
@@ -190,7 +188,7 @@ server {
 @@LOCATIONS@@
 }
 TPL
-    ok "$(basename "$NX_CONF_PANEL")"
+    okm nginx_wrote "$(basename "$NX_CONF_PANEL")"
 }
 
 nginx_write_decoy() {
@@ -232,7 +230,7 @@ server {
     }
 }
 TPL
-    ok "$(basename "$NX_CONF_DECOY")"
+    okm nginx_wrote "$(basename "$NX_CONF_DECOY")"
 }
 
 nginx_write_stream() {
@@ -272,16 +270,16 @@ server {
     error_log /var/log/nginx/nx-revpro-stream.log warn;
 }
 TPL
-    ok "$(basename "$NX_CONF_STREAM")"
+    okm nginx_wrote "$(basename "$NX_CONF_STREAM")"
 }
 
 nginx_test() {
     local out
     if ! out=$(nginx -t 2>&1); then
         printf '%s\n' "$out" >&2
-        die "nginx -t не прошёл"
+        diem nginx_test_fail
     fi
-    ok "nginx -t в порядке"
+    okm nginx_test_ok
 }
 
 # Перезагрузка с проверкой результата. Раньше при неактивном nginx.service
@@ -296,14 +294,14 @@ nginx_reload() {
     nginx_test
 
     if ! systemctl restart nginx 2>/dev/null; then
-        err "nginx не перезапустился. Последние строки error.log:"
+        errm nginx_errlog
         tail -n 8 /var/log/nginx/error.log 2>/dev/null | sed 's/^/      /' >&2 || true
-        die "nginx не стартует"
+        diem nginx_start_fail
     fi
     systemctl enable --quiet nginx 2>/dev/null || true
 
-    systemctl is-active --quiet nginx || die "nginx.service не активен после перезапуска"
-    ok "nginx перезапущен с новыми конфигами"
+    systemctl is-active --quiet nginx || diem nginx_inactive
+    okm nginx_restarted
 }
 
 # Фаза 1: только :80, 443 ещё свободен для certbot и для того, чтобы не
@@ -339,14 +337,11 @@ nginx_phase_full() {
 # Это проверка диска, не памяти процесса — применение гарантирует restart.
 nginx_assert_loaded() {
     local live
-    live=$(nginx -T 2>/dev/null) || die "nginx -T не отработал"
+    live=$(nginx -T 2>/dev/null) || diem nginx_test_fail
     if ! grep -q 'nx-revpro' <<<"$live"; then
-        err "работающий nginx не содержит конфигов nx-revpro"
-        err "скорее всего в $NX_NGINX_MAIN нет строки:"
-        err "    include ${NX_NGINX_CONFD}/*.conf;"
-        die "конфиги nx-revpro не загружены"
+        diem nginx_notloaded "$NX_NGINX_CONFD"
     fi
-    ok "конфиги nx-revpro на месте и синтаксически верны"
+    okm nginx_files_ok
 }
 
 # reload не перепривязывает сокеты: старые воркеры держат прежние адреса, и
@@ -358,15 +353,15 @@ nginx_ensure_listening() {
     local spec addr port missing=0
     for spec in "$@"; do
         read -r addr port <<<"$spec"
-        listening "$addr" "$port" || { missing=1; info "$addr:$port ещё не занят"; }
+        listening "$addr" "$port" || { missing=1; infom nginx_notbound "$addr" "$port"; }
     done
     (( missing )) || return 0
 
-    warn "nginx не занял ожидаемые адреса — reload их не перепривязывает, перезапускаю"
+    warnm nginx_rebind
     systemctl restart nginx || {
-        err "последние строки error.log:"
+        errm nginx_errlog
         tail -n 5 /var/log/nginx/error.log 2>/dev/null | sed 's/^/      /' >&2 || true
-        die "nginx restart не удался"
+        diem nginx_start_fail
     }
 
     local i
@@ -376,16 +371,16 @@ nginx_ensure_listening() {
             read -r addr port <<<"$spec"
             listening "$addr" "$port" || missing=1
         done
-        (( missing )) || { ok "nginx слушает все ожидаемые адреса"; return 0; }
+        (( missing )) || { okm nginx_bound_ok; return 0; }
         sleep 1
     done
 
-    err "после перезапуска nginx всё равно не слушает нужные адреса:"
+    errm nginx_bind_fail
     for spec in "$@"; do
         read -r addr port <<<"$spec"
         listening "$addr" "$port" || err "    $addr:$port"
     done
-    err "последние строки error.log:"
+    errm nginx_errlog
     tail -n 5 /var/log/nginx/error.log 2>/dev/null | sed 's/^/      /' >&2 || true
-    die "nginx не занял нужные адреса"
+    diem nginx_bind_fail
 }

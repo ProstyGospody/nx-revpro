@@ -4,48 +4,40 @@
 
 NX_PKGS=(nginx libnginx-mod-stream certbot sqlite3 curl jq openssl ca-certificates dnsutils qrencode)
 
-preflight_root() {
-    [[ $EUID -eq 0 ]] || die "нужны права root: sudo $0 ..."
-}
+preflight_root() { [[ $EUID -eq 0 ]] || diem need_root "$0"; }
 
 preflight_os() {
-    [[ -r /etc/os-release ]] || die "не найден /etc/os-release — поддерживаются Debian/Ubuntu"
+    [[ -r /etc/os-release ]] || diem no_osrelease
     # shellcheck disable=SC1091
     . /etc/os-release
     case "${ID:-}:${ID_LIKE:-}" in
-        ubuntu*|debian*|*debian*) ok "ОС: ${PRETTY_NAME:-$ID}" ;;
-        *) die "поддерживаются только Debian/Ubuntu (обнаружено: ${PRETTY_NAME:-$ID})" ;;
+        ubuntu*|debian*|*debian*) okm os_ok "${PRETTY_NAME:-$ID}" ;;
+        *) diem os_bad "${PRETTY_NAME:-${ID:-?}}" ;;
     esac
 }
 
 preflight_packages() {
-    local missing=()
-    local p
+    local missing=() p
     for p in "${NX_PKGS[@]}"; do
         dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q "ok installed" || missing+=("$p")
     done
     if (( ${#missing[@]} )); then
-        info "ставлю пакеты: ${missing[*]}"
+        infom pkg_install "${missing[*]}"
         DEBIAN_FRONTEND=noninteractive apt-get update -qq
         DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${missing[@]}" \
-            || die "apt-get install не отработал: ${missing[*]}"
+            || diem pkg_fail "${missing[*]}"
     fi
-    ok "зависимости на месте"
+    okm pkg_ok
 }
 
 preflight_nginx_modules() {
-    local out
-    out=$(nginx -V 2>&1)
-    grep -q -- '--with-stream_ssl_preread_module' <<<"$out" \
-        || grep -q 'ngx_stream_ssl_preread' <<<"$(ls /usr/lib/nginx/modules 2>/dev/null)" \
-        || die "у nginx нет ssl_preread — поставьте nginx-full / libnginx-mod-stream"
-    [[ -e /etc/nginx/modules-enabled/50-mod-stream.conf ]] \
-        || warn "не вижу /etc/nginx/modules-enabled/50-mod-stream.conf; если stream не загрузится — проверьте libnginx-mod-stream"
-    ok "stream + ssl_preread доступны"
+    nginx -V 2>&1 | grep -q -- '--with-stream_ssl_preread_module' || diem nginx_nostream
+    [[ -e /etc/nginx/modules-enabled/50-mod-stream.conf ]] || warnm nginx_nomod
+    okm nginx_stream_ok
 }
 
-# nginx >= 1.25.1 хочет отдельную директиву `http2 on;`, более старые —
-# слово http2 в listen. Заполняет NX_HTTP2_LISTEN и NX_HTTP2_DIRECTIVE.
+# nginx >= 1.25.1 хочет отдельную директиву `http2 on;`, более старые — слово
+# http2 в listen. Заполняет NX_HTTP2_LISTEN и NX_HTTP2_DIRECTIVE.
 preflight_nginx_http2_style() {
     local ver major minor patch
     ver=$(nginx -v 2>&1 | sed -n 's|.*nginx/\([0-9.]*\).*|\1|p')
@@ -58,20 +50,20 @@ preflight_nginx_http2_style() {
         NX_HTTP2_LISTEN=" http2"
         NX_HTTP2_DIRECTIVE="    # http2 включён в listen (nginx ${ver})"
     fi
-    info "nginx ${ver:-?}"
+    infom nginx_ver "${ver:-?}"
 }
 
 preflight_xui() {
-    [[ -f "$XUI_DB" ]] || die "не найдена БД панели $XUI_DB — сначала установите 3x-ui (см. README)"
+    [[ -f "$XUI_DB" ]] || diem xui_nodb "$XUI_DB"
     systemctl list-unit-files "${XUI_SERVICE}.service" --no-legend 2>/dev/null | grep -q . \
-        || die "нет systemd-юнита ${XUI_SERVICE}.service"
+        || diem xui_nounit "$XUI_SERVICE"
     local kind
     kind=$(head -c 16 "$XUI_DB" | tr -d '\0')
-    [[ $kind == SQLite* ]] || die "$XUI_DB не похож на SQLite — режим MySQL не поддерживается"
-    ok "3x-ui найдена, БД SQLite"
+    [[ $kind == SQLite* ]] || diem xui_notsqlite "$XUI_DB"
+    okm xui_ok
 }
 
-# --- сеть ------------------------------------------------------------------
+# --- сеть --------------------------------------------------------------------
 
 detect_bind_ip() {
     { ip -4 route get 1.1.1.1 2>/dev/null || true; } |
@@ -90,30 +82,27 @@ detect_public_ip() {
 # awk вместо grep: пустой результат не должен ронять pipefail у вызывающего
 resolve_a() { dig +short A "$1" @1.1.1.1 2>/dev/null | awk '/^[0-9.]+$/ { print; exit }'; }
 
-# check_dns <домен> <публичный ip> — не фатально при FORCE=1
 check_dns() {
     local domain=$1 public=$2 got
     got=$(resolve_a "$domain")
     if [[ -z $got ]]; then
-        if [[ ${FORCE:-0} == 1 ]]; then warn "$domain: A-запись не найдена (--force)"; return 0; fi
-        die "$domain: нет A-записи. Направьте домен на $public или запустите с --force"
+        [[ ${FORCE:-0} == 1 ]] && { warnm dns_missing_force "$domain"; return 0; }
+        diem dns_missing "$domain" "$public"
     fi
     if [[ $got != "$public" ]]; then
-        if [[ ${FORCE:-0} == 1 ]]; then warn "$domain -> $got, а сервер $public (--force)"; return 0; fi
-        die "$domain указывает на $got, а не на $public. Поправьте DNS или --force"
+        [[ ${FORCE:-0} == 1 ]] && { warnm dns_wrong_force "$domain" "$got" "$public"; return 0; }
+        diem dns_wrong "$domain" "$got" "$public"
     fi
-    ok "$domain -> $got"
+    okm dns_ok "$domain" "$got"
 }
 
-# Порты, которые должны быть свободны (либо заняты уже нашим nginx).
 # Порты, которые должны быть свободны либо принадлежать нашему nginx.
 # Проверять по имени процесса мало: посторонний nginx, запущенный вне
 # nginx.service, тоже называется nginx, но наши конфиги ему неизвестны —
 # он будет отвечать 404, пока systemd-экземпляр не может занять порт.
 preflight_ports() {
-    local bind=$1 hit pid
-    local -a checks=("0.0.0.0 80" "$bind 443" "127.0.0.1 7443" "127.0.0.1 9443")
-    local c addr port
+    local bind=$1 hit pid c addr port
+    local -a checks=("0.0.0.0 80" "$bind 443" "127.0.0.1 $PANEL_HTTPS_PORT" "127.0.0.1 $DECOY_HTTPS_PORT")
 
     for c in "${checks[@]}"; do
         read -r addr port <<<"$c"
@@ -122,28 +111,24 @@ preflight_ports() {
 
         pid=$(pids_from_ss "$hit" | head -1)
         if grep -q '"nginx"' <<<"$hit" && pid_in_unit "$pid" 'nginx.service'; then
-            info "$addr:$port уже за nginx.service — переиспользую"
+            infom port_reuse "$addr" "$port"
             continue
         fi
 
         if grep -q '"nginx"' <<<"$hit"; then
-            err "$addr:$port держит nginx, не относящийся к nginx.service (pid ${pid:-?})"
-            err "  команда: $(pid_cmdline "$pid" 2>/dev/null || echo '<не прочитать>')"
-            err "  cgroup:  $(head -1 "/proc/$pid/cgroup" 2>/dev/null || echo '<не прочитать>')"
-            err "Наши конфиги лежат в ${NX_NGINX_CONFD:-/etc/nginx/conf.d}, но этот процесс"
-            err "их не читал — запросы будут получать 404, а systemd-экземпляр не сможет"
-            err "занять порт (bind: Address already in use)."
-            err "Остановите посторонний экземпляр и запустите install заново."
-            die "$addr:$port занят чужим nginx"
+            errm port_foreign_nginx "$addr" "$port" "${pid:-?}"
+            errm port_foreign_cmd "$(pid_cmdline "$pid" 2>/dev/null || echo '?')"
+            errm port_foreign_why
+            exit 1
         fi
 
-        die "$addr:$port занят посторонним процессом: $(sed 's/.*users://' <<<"$hit")"
+        diem port_busy "$addr" "$port" "$(sed 's/.*users://' <<<"$hit")"
     done
 
     # 127.0.0.1:443 должен остаться за Xray, а не за nginx
     hit=$(ss -lntpH 2>/dev/null | awk '$4 == "127.0.0.1:443"')
     if [[ -n $hit ]] && ! grep -qE '"xray|"x-ui' <<<"$hit"; then
-        die "127.0.0.1:443 занят не Xray: $(sed 's/.*users://' <<<"$hit")"
+        diem port_xray "$(sed 's/.*users://' <<<"$hit")"
     fi
-    ok "порты свободны (nginx: :80, ${bind}:443, 127.0.0.1:7443, 127.0.0.1:9443)"
+    okm ports_ok "$bind" "$PANEL_HTTPS_PORT" "$DECOY_HTTPS_PORT"
 }

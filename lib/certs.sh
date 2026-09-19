@@ -36,16 +36,16 @@ certs_install_hook() {
 systemctl reload nginx 2>/dev/null || true
 HOOK
     chmod 755 "$LE_HOOK"
-    ok "deploy-hook: $LE_HOOK"
+    okm cert_hook "$LE_HOOK"
 }
 
 certs_check_timer() {
     if systemctl is-enabled --quiet certbot.timer 2>/dev/null; then
-        ok "автопродление: certbot.timer активен"
+        okm cert_timer_ok "certbot.timer"
     elif systemctl is-enabled --quiet snap.certbot.renew.timer 2>/dev/null; then
-        ok "автопродление: snap.certbot.renew.timer активен"
+        okm cert_timer_ok "snap.certbot.renew.timer"
     else
-        warn "таймер certbot не включён — 'systemctl enable --now certbot.timer'"
+        warnm cert_timer_off
     fi
 }
 
@@ -67,46 +67,46 @@ certs_issue() {
         days=$(cert_days_left "$domain")
         staged=0; cert_is_staging "$domain" && staged=1
         if [[ $staged == "${STAGING:-0}" ]] && (( days > 30 )); then
-            ok "сертификат $domain: ещё $days дн., пропускаю выпуск"
+            okm cert_skip "$domain" "$days"
             return 0
         fi
         if [[ $staged != "${STAGING:-0}" ]]; then
-            info "сертификат $domain меняет тип (staging=$staged -> ${STAGING:-0}), перевыпускаю"
+            infom cert_switch "$domain" "$staged" "${STAGING:-0}"
             args+=(--force-renewal)
         fi
     fi
 
-    info "certbot: $domain (staging=${STAGING:-0})"
+    infom cert_request "$domain" "${STAGING:-0}"
     if ! certbot "${args[@]}"; then
         # Переход с тестового CA на боевой certbot иногда не делает поверх
         # существующего сертификата. Свой же staging-сертификат удалить не
         # жалко: он всё равно не доверенный.
         if [[ ${STAGING:-0} == 0 ]] && cert_is_staging "$domain"; then
-            warn "не удалось перевыпустить поверх тестового — удаляю его и пробую ещё раз"
+            warnm cert_retry_delete
             certbot delete --cert-name "$domain" --non-interactive >/dev/null 2>&1 || true
             certbot "${args[@]}" \
-                || die "certbot не выпустил сертификат для $domain — смотрите /var/log/letsencrypt/letsencrypt.log"
+                || diem cert_fail "$domain"
         else
-            die "certbot не выпустил сертификат для $domain — смотрите /var/log/letsencrypt/letsencrypt.log"
+            diem cert_fail "$domain"
         fi
     fi
-    cert_exists "$domain" || die "certbot отработал, но $(cert_path "$domain") не появился"
+    cert_exists "$domain" || diem cert_missing_after "$(cert_path "$domain")"
 
     if [[ ${STAGING:-0} == 0 ]] && cert_is_staging "$domain"; then
-        die "для $domain всё ещё лежит тестовый сертификат — браузер ему не поверит"
+        diem cert_still_staging "$domain"
     fi
-    ok "сертификат $domain готов (осталось $(cert_days_left "$domain") дн.)"
+    okm cert_ready "$domain" "$(cert_days_left "$domain")"
 }
 
 certs_report() {
-    local d
+    local d tag
     for d in "$@"; do
         if cert_exists "$d"; then
-            local tag=""
+            tag=""
             cert_is_staging "$d" && tag=" ${C_YEL}[STAGING]${C_OFF}"
-            printf '  %s.%s %s: %s дн.%s\n' "$C_DIM" "$C_OFF" "$d" "$(cert_days_left "$d")" "$tag"
+            infom cert_days "$d" "$(cert_days_left "$d")" "$tag"
         else
-            err "$d: сертификата нет"
+            errm cert_none "$d"
         fi
     done
 }
@@ -132,23 +132,15 @@ certs_selftest() {
     rm -f "$path"
 
     if [[ $body == "$token" ]]; then
-        ok "webroot для $domain отдаётся корректно"
+        okm webroot_ok "$domain"
         return 0
     fi
 
-    err "проверка webroot для $domain не прошла: HTTP $code"
-    err "по http://${domain}/.well-known/acme-challenge/... приходит не наш файл,"
-    err "значит запрос обслуживает чужой server-блок, а не nx-revpro."
-    err ""
-    err "Кто ещё объявляет этот домен:"
-    err "    grep -rn 'server_name' /etc/nginx/sites-enabled/ /etc/nginx/conf.d/"
-    err "Что реально загружено в nginx:"
-    err "    nginx -T | grep -nE 'server_name|listen '"
-    err ""
-    err "Последние ошибки nginx:"
-    tail -n 3 /var/log/nginx/error.log 2>/dev/null | sed 's/^/      /' >&2 || true
-    err ""
-    err "Права на пути webroot:"
-    namei -l "$NX_ACME_ROOT/.well-known/acme-challenge" 2>/dev/null | sed 's/^/      /' >&2 || true
+    errm webroot_fail "$domain" "$code"
+    errm webroot_why
+    errm webroot_errlog
+    tail -n 3 /var/log/nginx/error.log 2>/dev/null | sed 's/^/        /' >&2 || true
+    errm webroot_perms
+    namei -l "$NX_ACME_ROOT/.well-known/acme-challenge" 2>/dev/null | sed 's/^/        /' >&2 || true
     return 1
 }

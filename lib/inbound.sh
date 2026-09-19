@@ -26,27 +26,21 @@ inbound_find_by_port() {
 
 # inbound_expected_hint — что именно должно быть заведено в панели.
 # inbound_expected_hint — что именно должно быть заведено в панели.
+# inbound_expected_hint — что именно должно быть заведено в панели.
+# Названия полей не переводятся: интерфейс 3x-ui англоязычный, и человек
+# ищет глазами ровно эти подписи.
 inbound_expected_hint() {
-    cat <<HINT
-  Протокол        VLESS
-  Remark          ${INBOUND_REMARK}
-  Listen IP       127.0.0.1
-  Port            ${XRAY_PORT}
-  Flow            xtls-rprx-vision
-  Security        REALITY
-    Dest          127.0.0.1:${DECOY_HTTPS_PORT}
-    SNI           ${DECOY_DOMAIN}
-  Transport       TCP
-    Proxy Protocol        ВКЛЮЧИТЬ
-  Custom share address    ${SHARE_ADDRESS:-$DECOY_DOMAIN}
-
-  Последние два поля легко пропустить, а без них не работает:
-    Proxy Protocol       — stream-роутер шлёт PROXY-заголовок, без него
-                           Xray примет его за мусор и оборвёт соединение;
-    Custom share address — инбаунд слушает 127.0.0.1, и без явного адреса
-                           панель подставит в ссылку что угодно, вплоть до
-                           адреса того, кто открыл панель.
-HINT
+    kv "Protocol"             "VLESS"
+    kv "Remark"               "$INBOUND_REMARK"
+    kv "Listen IP"            "127.0.0.1"
+    kv "Port"                 "$XRAY_PORT"
+    kv "Flow"                 "xtls-rprx-vision"
+    kv "Security"             "REALITY"
+    kv "  Dest"               "127.0.0.1:${DECOY_HTTPS_PORT}"
+    kv "  SNI"                "$DECOY_DOMAIN"
+    kv "Transport"            "TCP"
+    kv "  Proxy Protocol"     "${C_YEL}ON${C_OFF}"
+    kv "Custom share address" "${C_YEL}${SHARE_ADDRESS:-$DECOY_DOMAIN}${C_OFF}"
 }
 
 # inbound_check <json> — сверяет инбаунд с тем, что настроил nginx.
@@ -56,46 +50,44 @@ inbound_check() {
     ss=$(jq -r '.streamSettings // "{}"' <<<"$inb")
 
     v=$(jq -r '.protocol // ""' <<<"$inb")
-    [[ $v == vless ]] || { err "протокол '$v', ожидался vless"; bad=1; }
+    [[ $v == vless ]] || { errm inb_proto "$v"; bad=1; }
 
     v=$(jq -r '.port' <<<"$inb")
     if [[ $v != "$XRAY_PORT" ]]; then
-        err "порт инбаунда $v, а share-ссылка строится именно из него;"
-        err "снаружи слушается ${PUBLIC_PORT} — клиенты пойдут не туда"
-        bad=1
+        errm inb_port "$v" "$PUBLIC_PORT"; bad=1
     fi
 
     v=$(jq -r '.listen // ""' <<<"$inb")
     [[ $v == "127.0.0.1" ]] \
-        || { err "инбаунд слушает '${v:-все интерфейсы}', ожидалось 127.0.0.1"; bad=1; }
+        || { errm inb_listen "${v:-${M[val_all_ifaces]}}"; bad=1; }
 
     v=$(jq -r '.tcpSettings.acceptProxyProtocol // false' <<<"$ss")
     [[ $v == true ]] \
-        || { err "acceptProxyProtocol выключен, а stream-роутер шлёт PROXY — соединения не поднимутся"; bad=1; }
+        || { errm inb_pp; bad=1; }
 
     v=$(jq -r '.security // ""' <<<"$ss")
-    [[ $v == reality ]] || { err "security '$v', ожидался reality"; bad=1; }
+    [[ $v == reality ]] || { errm inb_sec "$v"; bad=1; }
 
     v=$(jq -r '.realitySettings.dest // ""' <<<"$ss")
     [[ $v == "127.0.0.1:${DECOY_HTTPS_PORT}" ]] \
-        || { err "realitySettings.dest '$v', ожидалось 127.0.0.1:${DECOY_HTTPS_PORT}"; bad=1; }
+        || { errm inb_dest "$v" "$DECOY_HTTPS_PORT"; bad=1; }
 
     v=$(jq -r '.realitySettings.serverNames[0] // ""' <<<"$ss")
     [[ $v == "$DECOY_DOMAIN" ]] \
-        || { err "serverNames[0] '$v', а сертификат выписан на $DECOY_DOMAIN"; bad=1; }
+        || { errm inb_sni "$v" "$DECOY_DOMAIN"; bad=1; }
 
     # Адрес в ссылке. Инбаунд слушает loopback, поэтому без явного Custom share
     # address панель подставляет произвольный адрес — ссылки из UI не работают.
     v=$(jq -r '.externalProxy[0].dest // ""' <<<"$ss")
     if [[ -z $v ]]; then
-        warn "не задан Custom share address — ссылки, скопированные из панели, будут с неверным адресом"
-        warn "  впишите в инбаунде: ${SHARE_ADDRESS:-$DECOY_DOMAIN}"
+        warnm inb_share_unset
+        warnm inb_share_hint "${SHARE_ADDRESS:-$DECOY_DOMAIN}"
     elif [[ $v != "${SHARE_ADDRESS:-$DECOY_DOMAIN}" ]]; then
-        warn "Custom share address '$v', ожидался ${SHARE_ADDRESS:-$DECOY_DOMAIN}"
+        warnm inb_share_wrong "$v" "${SHARE_ADDRESS:-$DECOY_DOMAIN}"
     fi
 
     v=$(jq -r '[.settings | fromjson | .clients[]? | select(.flow != "xtls-rprx-vision")] | length' <<<"$inb" 2>/dev/null || echo 0)
-    (( v == 0 )) || warn "у $v клиент(ов) flow не xtls-rprx-vision"
+    (( v == 0 )) || warnm inb_flow "$v"
 
     return $bad
 }
@@ -118,12 +110,12 @@ inbound_links() {
     [[ -z $addr ]] && addr=${SHARE_ADDRESS:-$sni}
 
     if [[ -z $pbk ]]; then
-        err "у инбаунда нет publicKey — ссылку не собрать"
+        errm inb_nopbk
         return 1
     fi
 
     rows=$(jq -r '.settings | fromjson | .clients[]? | [.id, (.email // ""), (.flow // "")] | @tsv' <<<"$inb" 2>/dev/null) || rows=""
-    [[ -n $rows ]] || { warn "в инбаунде нет клиентов — добавьте их в панели"; return 0; }
+    [[ -n $rows ]] || { warnm inb_noclients; return 0; }
 
     while IFS=$'\t' read -r uuid email flow; do
         [[ -n $uuid ]] || continue

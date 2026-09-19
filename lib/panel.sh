@@ -28,7 +28,7 @@ db_get() {
     k=$(sq "$1")
     v=$(sqlite3 -noheader "$XUI_DB" \
         "SELECT COALESCE((SELECT value FROM settings WHERE key='$k' LIMIT 1), char(1));") \
-        || die "sqlite3: не смог прочитать settings.$1"
+        || diem sqlite_read_fail ""
     if [[ $v == "$NX_DB_SENTINEL" ]]; then
         printf '%s' "${XUI_DEFAULTS[$1]-}"
     else
@@ -44,7 +44,7 @@ BEGIN IMMEDIATE;
 UPDATE settings SET value='$v' WHERE key='$k';
 INSERT INTO settings (key, value) SELECT '$k', '$v'
   WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key='$k');
-COMMIT;" || die "sqlite3: не смог записать settings.$1"
+COMMIT;" || diem sqlite_write_fail ""
 }
 
 # panel_read_settings — заполняет глобальные PANEL_* из БД.
@@ -55,7 +55,6 @@ panel_read_settings() {
     PANEL_WEB_CERT=$(db_get webCertFile)
     PANEL_WEB_KEY=$(db_get webKeyFile)
     PANEL_BASE_PATH=$(norm_path "$(db_get webBasePath)")
-    PANEL_SECRET=$(db_get secret)
     PANEL_SUB_ENABLE=$(db_get subEnable)
     PANEL_SUB_PORT=$(db_get subPort)
     PANEL_SUB_LISTEN=$(db_get subListen)
@@ -65,12 +64,14 @@ panel_read_settings() {
 
 panel_report_settings() {
     panel_read_settings
-    info "webPort      = $PANEL_WEB_PORT"
-    info "webListen    = ${PANEL_WEB_LISTEN:-<все интерфейсы>}"
-    info "webBasePath  = $PANEL_BASE_PATH"
-    info "webCertFile  = ${PANEL_WEB_CERT:-<пусто>}"
-    info "webDomain    = ${PANEL_WEB_DOMAIN:-<пусто>}"
-    info "subEnable    = $PANEL_SUB_ENABLE  subPort = $PANEL_SUB_PORT  subPath = $PANEL_SUB_PATH"
+    kv "webPort"     "$PANEL_WEB_PORT"
+    kv "webListen"   "${PANEL_WEB_LISTEN:-${M[val_all_ifaces]}}"
+    kv "webBasePath" "$PANEL_BASE_PATH"
+    kv "webCertFile" "${PANEL_WEB_CERT:-${M[val_empty]}}"
+    kv "webDomain"   "${PANEL_WEB_DOMAIN:-${M[val_empty]}}"
+    kv "subEnable"   "$PANEL_SUB_ENABLE"
+    kv "subPort"     "$PANEL_SUB_PORT"
+    kv "subPath"     "$PANEL_SUB_PATH"
 }
 
 # panel_apply_settings <panel_domain> — приводит панель к виду "за nginx".
@@ -80,9 +81,10 @@ panel_apply_settings() {
     panel_read_settings
 
     bak=$(backup_file "$XUI_DB")
-    [[ -n $bak ]] && info "бэкап БД: $bak"
+    [[ -n $bak ]] && infom panel_db_backup "$bak"
+    NX_DB_BACKUP=$bak
 
-    systemctl stop "$XUI_SERVICE" || die "не смог остановить $XUI_SERVICE"
+    systemctl stop "$XUI_SERVICE" || diem panel_stop_fail "$XUI_SERVICE"
 
     # TLS терминирует nginx — панель должна отдавать чистый HTTP на loopback.
     db_set webCertFile ""
@@ -100,26 +102,26 @@ panel_apply_settings() {
     db_set subURI "https://${panel_domain}${PANEL_SUB_PATH}"
     db_set subJsonURI "https://${panel_domain}${PANEL_SUB_JSON_PATH}"
 
-    systemctl start "$XUI_SERVICE" || die "не смог запустить $XUI_SERVICE"
-    panel_wait_up || die "панель не поднялась на 127.0.0.1:${PANEL_WEB_PORT}"
+    systemctl start "$XUI_SERVICE" || diem panel_start_fail "$XUI_SERVICE"
+    panel_wait_up || diem panel_down "$PANEL_WEB_PORT"
 
     case ${PANEL_ROOT_CODE:-000} in
         200|301|302|307|308) ;;
-        *) warn "корень панели отвечает $PANEL_ROOT_CODE — до проверки пароля дело ещё не дошло, а панель уже отказывает" ;;
+        *) warnm panel_odd_code "$PANEL_ROOT_CODE" ;;
     esac
 
     # Читаем обратно: 3x-ui умеет ронять subPath в "/" и терять webListen.
     local before_sub=$PANEL_SUB_PATH before_base=$PANEL_BASE_PATH bad=0
     panel_read_settings
-    [[ $PANEL_WEB_LISTEN == "127.0.0.1" ]] || { err "webListen не сохранился: '$PANEL_WEB_LISTEN'"; bad=1; }
-    [[ -z $PANEL_WEB_CERT && -z $PANEL_WEB_KEY ]] || { err "webCertFile/webKeyFile не очистились"; bad=1; }
-    [[ -z $PANEL_WEB_DOMAIN ]] || { err "webDomain не очистился: '$PANEL_WEB_DOMAIN' — панель будет отбивать 127.0.0.1 кодом 403"; bad=1; }
-    [[ $PANEL_SUB_PATH == "$before_sub" ]] || { err "subPath уехал: '$before_sub' -> '$PANEL_SUB_PATH'"; bad=1; }
-    [[ $PANEL_BASE_PATH == "$before_base" ]] || { err "webBasePath уехал: '$before_base' -> '$PANEL_BASE_PATH'"; bad=1; }
-    (( bad == 0 )) || die "настройки панели не применились; исходная БД лежит в $bak"
+    [[ $PANEL_WEB_LISTEN == "127.0.0.1" ]] || { errm panel_weblisten_bad "$PANEL_WEB_LISTEN"; bad=1; }
+    [[ -z $PANEL_WEB_CERT && -z $PANEL_WEB_KEY ]] || { errm panel_cert_bad; bad=1; }
+    [[ -z $PANEL_WEB_DOMAIN ]] || { errm panel_domain_bad "$PANEL_WEB_DOMAIN"; bad=1; }
+    [[ $PANEL_SUB_PATH == "$before_sub" ]] || { errm panel_subpath_moved "$before_sub" "$PANEL_SUB_PATH"; bad=1; }
+    [[ $PANEL_BASE_PATH == "$before_base" ]] || { errm panel_basepath_moved "$before_base" "$PANEL_BASE_PATH"; bad=1; }
+    (( bad == 0 )) || diem panel_apply_fail "$bak"
 
-    ok "панель: http://127.0.0.1:${PANEL_WEB_PORT}${PANEL_BASE_PATH} (TLS снят, listen на loopback)"
-    ok "подписка: 127.0.0.1:${PANEL_SUB_PORT}${PANEL_SUB_PATH}"
+    okm panel_applied "$PANEL_WEB_PORT" "$PANEL_BASE_PATH"
+    okm panel_sub_applied "$PANEL_SUB_PORT" "$PANEL_SUB_PATH"
 }
 
 # Ждёт, пока панель начнёт отвечать, и запоминает HTTP-код корня в

@@ -1,0 +1,34 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Установить shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+
+      - name: Синтаксис
+        run: |
+          for f in nxrev.sh setup.sh lib/*.sh lang/*.sh tests/*.sh; do
+            bash -n "$f" || exit 1
+          done
+
+      - name: shellcheck
+        run: shellcheck --shell=bash --severity=warning --external-sources nxrev.sh setup.sh lib/*.sh lang/*.sh tests/*.sh
+
+      - name: Каталоги сообщений
+        run: bash tests/check_lang.sh
+
+      - name: Модульные тесты
+        run: bash tests/unit.sh
+
+      - name: Генерация прикрытия
+        run: bash tests/decoy.sh

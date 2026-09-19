@@ -22,6 +22,7 @@ NX_HOME=$(dirname "$NX_SELF")
 . "$NX_HOME/lib/nginx.sh"
 . "$NX_HOME/lib/decoy.sh"
 . "$NX_HOME/lib/inbound.sh"
+. "$NX_HOME/lib/rollback.sh"
 
 # --- значения по умолчанию -------------------------------------------------
 PANEL_DOMAIN=""
@@ -40,46 +41,21 @@ PANEL_HTTPS_PORT=7443
 DECOY_HTTPS_PORT=9443
 INBOUND_REMARK="nx-reality"
 
+NX_ASSUME_YES=0
+NX_LANG_CONF=""
 NX_INBOUND_MISSING=0
 NX_INBOUND_BROKEN=0
 
 NX_HTTP2_LISTEN=""
 NX_HTTP2_DIRECTIVE=""
 
-usage() {
-    cat <<'USAGE'
-nx-revpro — VLESS+REALITY за nginx SNI-роутером.
-
-  nxrev.sh install --panel <домен> --decoy <домен> [--email <адрес>] [опции]
-  nxrev.sh status
-  nxrev.sh links
-  nxrev.sh regen-decoy
-
-Опции install:
-  --panel   <домен>   домен панели и подписки (SNI → nginx :7443)
-  --decoy   <домен>   домен-прикрытие, он же serverName для REALITY
-  --email   <адрес>   контакт для Let's Encrypt
-  --bind-ip <ip>      публичный IP для nginx (по умолчанию — из таблицы маршрутов)
-  --share-address <хост>  адрес в share-ссылке (по умолчанию decoy-домен)
-  --remark  <строка>  имя инбаунда (по умолчанию nx-reality)
-  --staging           тестовый CA Let's Encrypt: для отладки, без лимита 5/неделю
-  --no-staging        вернуться к боевому CA после отладки
-  --regen-decoy       пересобрать сайт-прикрытие заново
-  --force             не падать, если DNS ещё не разъехался
-  -h, --help          эта справка
-
-Инбаунд создаётся руками в панели: API 3x-ui меняется от версии к версии,
-и автосоздание ломалось бы на каждом обновлении. Скрипт его находит, сверяет
-с конфигурацией nginx и показывает ссылки.
-
-Повторный запуск install безопасен: конфиги и сертификаты обновляются.
-USAGE
-}
+usage() { printf '%s\n' "${M[usage]}"; }
 
 load_conf() {
     [[ -r $NX_CONF ]] || return 0
     # shellcheck disable=SC1090
     . "$NX_CONF"
+    NX_LANG_CONF=${NX_LANG_CONF:-}
 }
 
 save_conf() {
@@ -93,6 +69,7 @@ BIND_IP="$BIND_IP"
 SHARE_ADDRESS="$SHARE_ADDRESS"
 INBOUND_REMARK="$INBOUND_REMARK"
 STAGING=$STAGING
+NX_LANG_CONF="$NX_LANG"
 
 # Порты фиксированы архитектурой; XRAY_PORT обязан совпадать с PUBLIC_PORT,
 # иначе панель положит в share-ссылку не тот порт.
@@ -107,9 +84,9 @@ CONF
 }
 
 parse_args() {
-    local need_value="--panel --decoy --email --bind-ip --share-address --remark "
+    local need_value="--panel --decoy --email --bind-ip --share-address --remark --lang "
     while (( $# )); do
-        [[ $need_value == *"$1 "* && $# -lt 2 ]] && die "у $1 нет значения"
+        [[ $need_value == *"$1 "* && $# -lt 2 ]] && diem arg_noval "$1"
         case $1 in
             --panel)          PANEL_DOMAIN=$2; shift 2 ;;
             --decoy)          DECOY_DOMAIN=$2; shift 2 ;;
@@ -121,36 +98,41 @@ parse_args() {
             --no-staging)     STAGING=0; shift ;;
             --regen-decoy)    REGEN_DECOY=1; shift ;;
             --force)          FORCE=1; shift ;;
+            --lang)           i18n_load "$2"; shift 2 ;;
+            -y|--yes)         NX_ASSUME_YES=1; shift ;;
             -h|--help)        usage; exit 0 ;;
-            *) die "неизвестный аргумент: $1 (--help)" ;;
+            *) diem arg_unknown "$1" ;;
         esac
     done
 }
 
 resolve_addresses() {
     [[ -n $BIND_IP ]] || BIND_IP=$(detect_bind_ip)
-    [[ -n $BIND_IP ]] || die "не определил IP для bind — задайте --bind-ip"
+    [[ -n $BIND_IP ]] || diem bind_unknown
 
     if ! PUBLIC_IP=$(detect_public_ip); then
-        warn "не смог узнать внешний IP, считаю его равным $BIND_IP"
+        warnm pub_unknown "$BIND_IP"
         PUBLIC_IP=$BIND_IP
     fi
     if [[ $PUBLIC_IP != "$BIND_IP" ]]; then
-        info "внешний IP $PUBLIC_IP, локальный $BIND_IP — похоже на NAT, слушаю $BIND_IP"
+        infom nat_detected "$PUBLIC_IP" "$BIND_IP"
     fi
-    ok "bind ${BIND_IP}:443, снаружи ${PUBLIC_IP}:${PUBLIC_PORT}"
+    okm addr_ok "$BIND_IP" "$PUBLIC_IP" "$PUBLIC_PORT"
 }
 
 # --- install ---------------------------------------------------------------
 
 cmd_install() {
-    [[ -n $PANEL_DOMAIN ]] || die "не задан --panel"
-    [[ -n $DECOY_DOMAIN ]] || die "не задан --decoy"
-    [[ $PANEL_DOMAIN != "$DECOY_DOMAIN" ]] || die "--panel и --decoy должны различаться"
+    NX_STEP_TOTAL=10
+    banner
+    trap rollback_on_failure EXIT
+    [[ -n $PANEL_DOMAIN ]] || diem need_panel
+    [[ -n $DECOY_DOMAIN ]] || diem need_decoy
+    [[ $PANEL_DOMAIN != "$DECOY_DOMAIN" ]] || diem same_domains
     [[ -n $SHARE_ADDRESS ]] || SHARE_ADDRESS=$DECOY_DOMAIN
     state_init
 
-    step "Проверка окружения"
+    stepm step_env
     preflight_root
     preflight_os
     preflight_packages
@@ -158,46 +140,48 @@ cmd_install() {
     preflight_nginx_http2_style
     preflight_xui
 
-    step "Сеть и DNS"
+    stepm step_net
     resolve_addresses
     check_dns "$PANEL_DOMAIN" "$PUBLIC_IP"
     check_dns "$DECOY_DOMAIN" "$PUBLIC_IP"
     preflight_ports "$BIND_IP"
 
-    step "Настройки панели (как есть)"
+    stepm step_panel_read
     panel_report_settings
 
-    step "Привожу панель к работе за nginx"
+    stepm step_panel_apply
+    rollback_arm
     panel_apply_settings "$PANEL_DOMAIN"
 
     save_conf
 
-    step "Сайт-прикрытие"
+    stepm step_decoy
     decoy_generate "$REGEN_DECOY"
 
-    step "nginx: временный профиль только с :80 (для ACME)"
+    stepm step_acme
     nginx_phase_acme
 
-    step "Сертификаты Let's Encrypt"
-    [[ $STAGING == 1 ]] && warn "режим --staging: сертификаты не доверенные, для отладки"
+    stepm step_certs
+    [[ $STAGING == 1 ]] && warnm staging_warn
     certs_install_hook
     nginx_assert_loaded
-    certs_selftest "$PANEL_DOMAIN" || die "ACME-челлендж не доедет — сертификат не выпустить"
-    certs_selftest "$DECOY_DOMAIN" || die "ACME-челлендж не доедет — сертификат не выпустить"
+    certs_selftest "$PANEL_DOMAIN" || diem acme_blocked
+    certs_selftest "$DECOY_DOMAIN" || diem acme_blocked
     certs_issue "$PANEL_DOMAIN"
     certs_issue "$DECOY_DOMAIN"
     certs_check_timer
 
-    step "nginx: полный SNI-роутер"
+    stepm step_full
     nginx_phase_full
 
-    step "Инбаунд VLESS+REALITY"
+    stepm step_inbound
     report_inbound
 
-    step "Проверка"
+    stepm step_verify
     save_conf
-    do_verify || warn "часть проверок не прошла — смотрите вывод выше"
+    do_verify || warnm v_partial
 
+    rollback_disarm
     print_summary
 }
 
@@ -211,20 +195,20 @@ report_inbound() {
     if [[ -z $inb ]]; then
         clash=$(inbound_find_by_port "$XRAY_PORT")
         if [[ -n $clash ]]; then
-            warn "инбаунда '$INBOUND_REMARK' нет, но порт $XRAY_PORT занят инбаундом '$(jq -r .remark <<<"$clash")'"
+            warnm inb_port_taken "$INBOUND_REMARK" "$XRAY_PORT" "$(jq -r .remark <<<"$clash")"
             inb=$clash
         else
             NX_INBOUND_MISSING=1
-            warn "инбаунд не найден — создайте его в панели, параметры ниже"
+            warnm inb_missing
             return 0
         fi
     fi
 
     if inbound_check "$inb"; then
-        ok "инбаунд '$(jq -r .remark <<<"$inb")' сходится с конфигурацией nginx"
+        okm inb_ok "$(jq -r .remark <<<"$inb")"
     else
         NX_INBOUND_BROKEN=1
-        err "инбаунд не сходится с конфигурацией nginx — поправьте в панели"
+        errm inb_broken
     fi
 
     state_set INBOUND_ID "$(jq -r '.id' <<<"$inb")"
@@ -233,17 +217,15 @@ report_inbound() {
 }
 
 # Что показать человеку, если инбаунда ещё нет либо он разъехался.
+# Что показать человеку, если инбаунда ещё нет либо он разъехался.
 print_inbound_instructions() {
-    printf '\n%s--- Инбаунд нужно завести в панели ---%s\n' "$C_YEL" "$C_OFF"
-    printf 'Панель: https://%s%s\n\n' "$PANEL_DOMAIN" "$PANEL_BASE_PATH"
+    printf '\n  %s%s%s\n' "$C_YEL$C_B" "${M[inb_title]}" "$C_OFF"
+    printf '  %s\n\n' "$(_m inb_panel_at "$PANEL_DOMAIN" "$PANEL_BASE_PATH")"
     inbound_expected_hint
-    cat <<'TAIL'
-
-  Публичный ключ REALITY панель сгенерирует сама кнопкой "Get New Cert".
-  Клиентов добавляйте там же; flow у каждого — xtls-rprx-vision.
-
-Потом:  nxrev links   — покажет vless://-ссылки и QR
-TAIL
+    printf '\n  %s%s%s\n' "$C_DIM" "${M[inb_notes]}" "$C_OFF"
+    printf '    %s%s%s\n'  "$C_DIM" "${M[inb_note_pp]}" "$C_OFF"
+    printf '    %s%s%s\n'  "$C_DIM" "${M[inb_note_share]}" "$C_OFF"
+    printf '    %s%s%s\n'  "$C_DIM" "${M[inb_note_keys]}" "$C_OFF"
 }
 
 # --- проверки --------------------------------------------------------------
@@ -268,44 +250,43 @@ do_verify() {
                 "127.0.0.1 ${XRAY_PORT} xray-reality"; do
         read -r a p name <<<"$spec"
         if _listening "$a" "$p"; then
-            ok "слушает $a:$p ($name)"
+            okm v_listen_ok "$a" "$p" "$name"
         elif [[ $name == xray-reality && ${NX_INBOUND_MISSING:-0} == 1 ]]; then
-            info "127.0.0.1:$p свободен — инбаунда ещё нет, это ожидаемо"
+            infom v_listen_skip "$p"
         else
-            err "никто не слушает $a:$p ($name)"; rc=1
+            errm v_listen_no "$a" "$p" "$name"; rc=1
         fi
     done
 
     code=$(_http_code "$PANEL_DOMAIN" "$PANEL_BASE_PATH")
-    if [[ $code == 200 ]]; then ok "панель через SNI-роутер отвечает 200"
-    else err "панель по https://${PANEL_DOMAIN}${PANEL_BASE_PATH} вернула $code"; rc=1; fi
+    if [[ $code == 200 ]]; then okm v_panel_ok
+    else errm v_panel_no "$PANEL_DOMAIN" "$PANEL_BASE_PATH" "$code"; rc=1; fi
 
     # Сначала сам decoy-сервер, напрямую: если он не отвечает, REALITY тут ни при чём.
     code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 8 \
            --resolve "${DECOY_DOMAIN}:${DECOY_HTTPS_PORT}:127.0.0.1" \
            "https://${DECOY_DOMAIN}:${DECOY_HTTPS_PORT}/" 2>/dev/null) || code=000
     if [[ $code == 200 ]]; then
-        ok "прикрытие на 127.0.0.1:${DECOY_HTTPS_PORT} отвечает напрямую"
+        okm v_decoy_direct_ok "$DECOY_HTTPS_PORT"
     else
-        err "прикрытие на 127.0.0.1:${DECOY_HTTPS_PORT} вернуло $code — это nginx, не REALITY"
+        errm v_decoy_direct_no "$DECOY_HTTPS_PORT" "$code"
         rc=1
     fi
 
     if [[ ${NX_INBOUND_MISSING:-0} == 1 ]]; then
-        info "проверку REALITY пропускаю: инбаунда ещё нет"
+        infom v_reality_skip
     else
         code=$(_http_code "$DECOY_DOMAIN" "/")
-        if [[ $code == 200 ]]; then ok "прикрытие через REALITY-fallback отвечает 200"
+        if [[ $code == 200 ]]; then okm v_reality_ok
         else
-            err "https://${DECOY_DOMAIN}/ вернул $code — REALITY не передал соединение на :${DECOY_HTTPS_PORT}"
-            err "  Частая причина: у инбаунда выключен Proxy Protocol, а stream-роутер его шлёт."
-            err "  Путь целиком:  openssl s_client -connect ${BIND_IP}:443 -servername $DECOY_DOMAIN </dev/null"
+            errm v_reality_no "$DECOY_DOMAIN" "$code" "$DECOY_HTTPS_PORT"
+            errm v_reality_hint
             rc=1
         fi
     fi
 
     if [[ ${NX_INBOUND_MISSING:-0} == 1 ]]; then
-        info "проверку сертификата на decoy-SNI пропускаю: соединение идёт через REALITY"
+        infom v_cert_skip
         return $rc
     fi
 
@@ -313,9 +294,9 @@ do_verify() {
                 -servername "$DECOY_DOMAIN" 2>/dev/null \
              | openssl x509 -noout -issuer 2>/dev/null || true)
     if grep -q "Let's Encrypt\|STAGING" <<<"$issuer"; then
-        ok "на decoy-SNI отдаётся сертификат: ${issuer#issuer=}"
+        okm v_cert_ok "${issuer#issuer=}"
     else
-        err "на decoy-SNI пришёл не тот сертификат: ${issuer:-<пусто>}"; rc=1
+        errm v_cert_no "${issuer:-${M[val_empty]}}"; rc=1
     fi
 
     return $rc
@@ -325,30 +306,32 @@ print_summary() {
     local inb
     inb=$(inbound_find "$INBOUND_REMARK")
 
-    printf '\n%s================ ГОТОВО ================%s\n' "$C_GRN" "$C_OFF"
-    printf '  Панель      https://%s%s\n' "$PANEL_DOMAIN" "$PANEL_BASE_PATH"
-    printf '  Подписка    https://%s%s<subId>\n' "$PANEL_DOMAIN" "$PANEL_SUB_PATH"
-    printf '  Прикрытие   https://%s/   (%s)\n' "$DECOY_DOMAIN" "$(state_get DECOY_BRAND)"
-    printf '  Сертификаты\n'
+    printf '\n  %s%s %s%s\n' "$C_GRN$C_B" "$S_OK" "${M[sum_title]}" "$C_OFF"
+    printf '  %s%s%s\n' "$C_DIM" "──────────────────────────────────────────────" "$C_OFF"
+    kv "${M[sum_panel]}"  "https://${PANEL_DOMAIN}${PANEL_BASE_PATH}"
+    kv "${M[sum_sub]}"    "https://${PANEL_DOMAIN}${PANEL_SUB_PATH}<subId>"
+    kv "${M[sum_decoy]}"  "https://${DECOY_DOMAIN}/  ($(state_get DECOY_BRAND))"
+    kv "${M[sum_conf]}"   "$NX_CONF"
+    kv "${M[sum_state]}"  "$NX_STATE"
+    printf '\n'
     certs_report "$PANEL_DOMAIN" "$DECOY_DOMAIN"
-    [[ $STAGING == 1 ]] && printf '  %sСертификаты тестовые (--staging). Перезапустите с --no-staging для боевых.%s\n' "$C_YEL" "$C_OFF"
-    printf '  Конфиг      %s\n  Состояние   %s\n' "$NX_CONF" "$NX_STATE"
+    [[ $STAGING == 1 ]] && warnm sum_staging
 
     if [[ ${NX_INBOUND_MISSING:-0} == 1 || ${NX_INBOUND_BROKEN:-0} == 1 || -z $inb ]]; then
         print_inbound_instructions
         return 0
     fi
 
-    printf '\n  Ссылки:\n'
+    printf '\n  %s%s%s\n' "$C_B" "${M[sum_links]}" "$C_OFF"
     inbound_print_links "$inb"
-    printf '\n  Новых клиентов добавляйте в панели, затем:  nxrev links\n'
+    printf '\n  %s%s%s\n' "$C_DIM" "${M[sum_addmore]}" "$C_OFF"
 }
 
 # --- прочие команды --------------------------------------------------------
 
 _need_installed() {
     [[ -n $PANEL_DOMAIN && -n $DECOY_DOMAIN ]] \
-        || die "нет $NX_CONF — сначала запустите: $NX_SELF install --panel ... --decoy ..."
+        || diem not_installed "$NX_CONF"
     preflight_root
     preflight_xui
     [[ -n $BIND_IP ]] || BIND_IP=$(detect_bind_ip)
@@ -357,15 +340,15 @@ _need_installed() {
 
 cmd_status() {
     _need_installed
-    step "Инбаунд"
+    stepm step_inbound
     report_inbound
     [[ ${NX_INBOUND_MISSING:-0} == 1 ]] && print_inbound_instructions
-    step "Настройки панели"
+    stepm step_panel_read
     panel_report_settings
-    step "Сертификаты"
+    stepm step_certs
     certs_report "$PANEL_DOMAIN" "$DECOY_DOMAIN"
     certs_check_timer
-    step "Сквозная проверка"
+    stepm step_verify
     do_verify
 }
 
@@ -373,7 +356,7 @@ cmd_links() {
     _need_installed
     local inb
     inb=$(inbound_find "$INBOUND_REMARK")
-    [[ -n $inb ]] || die "инбаунд '$INBOUND_REMARK' не найден"
+    [[ -n $inb ]] || diem inb_notfound "$INBOUND_REMARK"
     inbound_print_links "$inb"
 }
 
@@ -386,18 +369,29 @@ cmd_regen_decoy() {
 
 # --- точка входа -----------------------------------------------------------
 
+cmd_uninstall() {
+    preflight_root
+    [[ -n $PANEL_DOMAIN ]] || PANEL_DOMAIN="<домен>"
+    uninstall_all "${NX_ASSUME_YES:-0}"
+}
+
 main() {
     local cmd=${1:-install}
     [[ $# -gt 0 ]] && shift || true
+
+    # Язык: переменная окружения, затем конфиг, затем --lang в parse_args.
+    i18n_load "${NX_LANG:-ru}"
     load_conf
+    [[ -n ${NX_LANG_CONF:-} ]] && i18n_load "$NX_LANG_CONF"
 
     case $cmd in
         install)      parse_args "$@"; cmd_install ;;
         status)       parse_args "$@"; cmd_status ;;
         links)        parse_args "$@"; cmd_links ;;
         regen-decoy)  parse_args "$@"; cmd_regen_decoy ;;
-        -h|--help|help) usage ;;
-        *) usage; die "неизвестная команда: $cmd" ;;
+        uninstall)    parse_args "$@"; cmd_uninstall ;;
+        -h|--help|help) banner; usage ;;
+        *) banner; usage; diem cmd_unknown "$cmd" ;;
     esac
 }
 
