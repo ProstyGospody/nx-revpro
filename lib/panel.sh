@@ -205,10 +205,23 @@ _post_form() {
 
 # Одна попытка логина. secret_field — под каким именем отправить secret-токен
 # (у разных сборок 3x-ui это loginSecret или secret), пусто — не отправлять.
+# Заголовки, которые шлёт сам веб-интерфейс панели. Свежие сборки 3x-ui
+# отбивают POST без Origin/Referer силами CSRF-middleware — до обработчика,
+# поэтому в журнале сервиса не остаётся ни строчки, а наружу летит голый 403.
+_panel_headers() {
+    NX_HDR=(-H "Origin: http://127.0.0.1:${PANEL_WEB_PORT}"
+            -H "Referer: $(panel_base_url)"
+            -H "X-Requested-With: XMLHttpRequest"
+            -H "Accept: application/json, text/plain, */*")
+}
+
+# Одна попытка логина. secret_field — под каким именем отправить secret-токен
+# (у разных сборок 3x-ui это loginSecret или secret), пусто — не отправлять.
 _try_login() {
     local secret_field=$1 out=$2
     rm -f "$NX_COOKIE"
-    local -a args=(-c "$NX_COOKIE"
+    _panel_headers
+    local -a args=(-c "$NX_COOKIE" "${NX_HDR[@]}"
                    --data-urlencode "username=$PANEL_USER"
                    --data-urlencode "password=$PANEL_PASS")
     [[ -n $secret_field && -n ${PANEL_SECRET:-} ]] \
@@ -298,7 +311,8 @@ panel_auth() {
 # api <GET|POST> <путь относительно base> [json-тело]
 api() {
     local method=$1 path=$2 data=${3:-}
-    local -a args=(-fsS --max-time 20 -X "$method")
+    _panel_headers
+    local -a args=(-fsS --max-time 20 -X "$method" "${NX_HDR[@]}")
     case ${PANEL_AUTH:-} in
         token)  args+=(-H "Authorization: Bearer $PANEL_TOKEN") ;;
         cookie) args+=(-b "$NX_COOKIE" -c "$NX_COOKIE") ;;
