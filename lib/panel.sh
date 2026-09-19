@@ -194,9 +194,26 @@ _auth_probe() {
 
 # POST формы с возвратом HTTP-кода. Без -f: код и тело нужны для диагностики,
 # а -f их как раз и прячет.
+# POST формы с возвратом HTTP-кода. Без -f: код и тело нужны для диагностики,
+# а -f их как раз и прячет. Код забираем в переменную, а не дописываем запасной
+# через ||: curl при ошибке уже напечатал "000", и получалось "000000".
 _post_form() {
-    local url=$1 out=$2; shift 2
-    curl -sS -o "$out" -w '%{http_code}' --max-time 15 "$@" "$url" 2>/dev/null || printf '000'
+    local url=$1 out=$2 code; shift 2
+    code=$(curl -sS -o "$out" -w '%{http_code}' --max-time 15 "$@" "$url" 2>/dev/null) || true
+    printf '%s' "${code:-000}"
+}
+
+# Одна попытка логина. secret_field — под каким именем отправить secret-токен
+# (у разных сборок 3x-ui это loginSecret или secret), пусто — не отправлять.
+_try_login() {
+    local secret_field=$1 out=$2
+    rm -f "$NX_COOKIE"
+    local -a args=(-c "$NX_COOKIE"
+                   --data-urlencode "username=$PANEL_USER"
+                   --data-urlencode "password=$PANEL_PASS")
+    [[ -n $secret_field && -n ${PANEL_SECRET:-} ]] \
+        && args+=(--data-urlencode "${secret_field}=$PANEL_SECRET")
+    _post_form "$(panel_base_url)login" "$out" "${args[@]}"
 }
 
 # Подбирает рабочий способ аутентификации: PANEL_AUTH = token | cookie.
@@ -220,47 +237,58 @@ panel_auth() {
         die "нет доступа к API панели"
     fi
 
-    rm -f "$NX_COOKIE"
-    local out="$NX_RUN/login.out" code body
-    local -a args=(-c "$NX_COOKIE"
-                   --data-urlencode "username=$PANEL_USER"
-                   --data-urlencode "password=$PANEL_PASS")
-    [[ -n ${PANEL_SECRET:-} ]] && args+=(--data-urlencode "loginSecret=$PANEL_SECRET")
-
-    code=$(_post_form "${base}login" "$out" "${args[@]}")
-    body=$(head -c 400 "$out" 2>/dev/null || true)
-    rm -f "$out"
-
-    # Тело ответа печатаем всегда, кроме успеха: у 3x-ui именно в нём написано,
-    # что не понравилось — пароль, secret-токен или второй фактор.
-    if [[ $code == 200 || $code == 204 ]] \
-       && [[ $(jq -r '.success // false' <<<"$body" 2>/dev/null) == true ]]; then
-        chmod 600 "$NX_COOKIE"
-        PANEL_AUTH=cookie
-        ok "API: сессия под пользователем $PANEL_USER"
-        return 0
+    # Если secret-токен задан, перебираем имена поля: разные сборки 3x-ui ждут
+    # его как loginSecret или как secret. Последняя попытка — вовсе без него.
+    local out="$NX_RUN/login.out" code=000 body="" field="" used=""
+    local -a variants
+    if [[ -n ${PANEL_SECRET:-} ]]; then
+        variants=(loginSecret secret "")
+        info "в настройках панели задан secret-токен — отправляю его при логине"
+    else
+        variants=("")
     fi
 
-    err "панель ответила $code на ${base}login"
+    for field in "${variants[@]}"; do
+        code=$(_try_login "$field" "$out")
+        body=$(head -c 400 "$out" 2>/dev/null || true)
+        used=${field:-без secret}
+
+        if [[ $code == 200 || $code == 204 ]] \
+           && [[ $(jq -r '.success // false' <<<"$body" 2>/dev/null) == true ]]; then
+            rm -f "$out"
+            chmod 600 "$NX_COOKIE"
+            PANEL_AUTH=cookie
+            ok "API: сессия под пользователем $PANEL_USER (secret как '$used')"
+            return 0
+        fi
+
+        info "попытка '$used' -> HTTP $code"
+        # Панель не отвечает вовсе — перебирать поля бессмысленно.
+        [[ $code == 000 ]] && break
+    done
+    rm -f "$out"
+
+    err "панель не пустила: последний ответ HTTP $code на ${base}login"
     [[ -n $body ]] && err "тело ответа: $body"
 
     case $code in
+        000)
+            err "ответа не было вообще: соединение не установилось или вышел таймаут."
+            err "Это не про пароль. Проверьте, жива ли панель:"
+            err "    systemctl status $XUI_SERVICE --no-pager"
+            err "    ss -lntp | grep ${PANEL_WEB_PORT}"
+            err "    curl -sS -o /dev/null -w '%{http_code}\n' -m 5 $(panel_base_url)"
+            err "Если корень отвечает, а login висит — панель могла забанить"
+            err "адрес после неудачных попыток: journalctl -u $XUI_SERVICE -n 50 --no-pager" ;;
         403)
-            err "403 отдаёт не проверка пароля, а middleware панели. Обычно это"
-            err "secret-токен, включённый второй фактор или ограничение по Host."
+            err "403 отдаёт не проверка пароля, а middleware панели."
             _auth_probe ;;
         401)
             err "логин или пароль не подошли"
             _auth_probe ;;
         404)
             err "не сходится webBasePath. Что реально лежит в БД:"
-            err "    sqlite3 $XUI_DB \"select value from settings where key='webBasePath'\""
-            ;;
-        000)
-            err "панель не ответила:"
-            err "    systemctl status $XUI_SERVICE --no-pager"
-            err "    ss -lntp | grep ${PANEL_WEB_PORT}"
-            ;;
+            err "    sqlite3 $XUI_DB \"select value from settings where key='webBasePath'\"" ;;
         *)
             _auth_probe ;;
     esac
