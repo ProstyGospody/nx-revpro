@@ -197,9 +197,20 @@ _auth_probe() {
 # POST формы с возвратом HTTP-кода. Без -f: код и тело нужны для диагностики,
 # а -f их как раз и прячет. Код забираем в переменную, а не дописываем запасной
 # через ||: curl при ошибке уже напечатал "000", и получалось "000000".
+# POST формы с возвратом HTTP-кода. Без -f: код и тело нужны для диагностики,
+# а -f их как раз и прячет. Код забираем в переменную, а не дописываем запасной
+# через ||: curl при ошибке уже напечатал "000", и получалось "000000".
+# stderr curl сохраняем — при коде 000 только там и написано, что случилось.
 _post_form() {
-    local url=$1 out=$2 code; shift 2
-    code=$(curl -sS -o "$out" -w '%{http_code}' --max-time 15 "$@" "$url" 2>/dev/null) || true
+    local url=$1 out=$2; shift 2
+    local errf="$NX_RUN/curl.err" code
+    if code=$(curl -sS -o "$out" -w '%{http_code}' --max-time 15 "$@" "$url" 2>"$errf"); then
+        NX_CURL_RC=0
+    else
+        NX_CURL_RC=$?
+    fi
+    NX_CURL_ERR=$(tr -d '\r' < "$errf" 2>/dev/null | head -c 200 || true)
+    rm -f "$errf"
     printf '%s' "${code:-000}"
 }
 
@@ -234,7 +245,9 @@ _b64url_d() {
 # читается без ключа.
 _csrf_from_cookie() {
     local raw outer mid
-    raw=$(awk '!/^#/ && NF >= 7 && $6 ~ /^(3x-ui|x-ui|session)$/ { print $7 }' \
+    # HttpOnly-куки curl пишет строкой "#HttpOnly_<домен>", поэтому отбрасывать
+    # всё, что начинается с #, нельзя — именно так терялась нужная кука.
+    raw=$(awk 'NF >= 7 && $6 ~ /^(3x-ui|x-ui|session)$/ { print $7 }' \
           "$NX_COOKIE" 2>/dev/null | tail -1)
     [[ -n $raw ]] || return 1
     outer=$(_b64url_d "$raw")
@@ -337,7 +350,8 @@ panel_auth() {
 
     case $code in
         000)
-            err "ответа не было вообще: соединение не установилось или вышел таймаут."
+            err "curl завершился с кодом ${NX_CURL_RC:-?} (28 — таймаут, 7 — отказ в соединении, 52 — пустой ответ, 56 — обрыв)"
+            [[ -n ${NX_CURL_ERR:-} ]] && err "curl сказал: $NX_CURL_ERR"
             err "Это не про пароль. Проверьте, жива ли панель:"
             err "    systemctl status $XUI_SERVICE --no-pager"
             err "    ss -lntp | grep ${PANEL_WEB_PORT}"
