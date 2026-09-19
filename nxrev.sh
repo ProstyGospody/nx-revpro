@@ -280,12 +280,28 @@ do_verify() {
     if [[ $code == 200 ]]; then ok "панель через SNI-роутер отвечает 200"
     else err "панель по https://${PANEL_DOMAIN}${PANEL_BASE_PATH} вернула $code"; rc=1; fi
 
+    # Сначала сам decoy-сервер, напрямую: если он не отвечает, REALITY тут ни при чём.
+    code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 8 \
+           --resolve "${DECOY_DOMAIN}:${DECOY_HTTPS_PORT}:127.0.0.1" \
+           "https://${DECOY_DOMAIN}:${DECOY_HTTPS_PORT}/" 2>/dev/null) || code=000
+    if [[ $code == 200 ]]; then
+        ok "прикрытие на 127.0.0.1:${DECOY_HTTPS_PORT} отвечает напрямую"
+    else
+        err "прикрытие на 127.0.0.1:${DECOY_HTTPS_PORT} вернуло $code — это nginx, не REALITY"
+        rc=1
+    fi
+
     if [[ ${NX_INBOUND_MISSING:-0} == 1 ]]; then
         info "проверку REALITY пропускаю: инбаунда ещё нет"
     else
         code=$(_http_code "$DECOY_DOMAIN" "/")
         if [[ $code == 200 ]]; then ok "прикрытие через REALITY-fallback отвечает 200"
-        else err "https://${DECOY_DOMAIN}/ вернул $code (REALITY не отдал соединение на :${DECOY_HTTPS_PORT})"; rc=1; fi
+        else
+            err "https://${DECOY_DOMAIN}/ вернул $code — REALITY не передал соединение на :${DECOY_HTTPS_PORT}"
+            err "  Частая причина: у инбаунда выключен Proxy Protocol, а stream-роутер его шлёт."
+            err "  Путь целиком:  openssl s_client -connect ${BIND_IP}:443 -servername $DECOY_DOMAIN </dev/null"
+            rc=1
+        fi
     fi
 
     if [[ ${NX_INBOUND_MISSING:-0} == 1 ]]; then
@@ -341,6 +357,9 @@ _need_installed() {
 
 cmd_status() {
     _need_installed
+    step "Инбаунд"
+    report_inbound
+    [[ ${NX_INBOUND_MISSING:-0} == 1 ]] && print_inbound_instructions
     step "Настройки панели"
     panel_report_settings
     step "Сертификаты"
