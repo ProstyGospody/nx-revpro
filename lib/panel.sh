@@ -220,25 +220,46 @@ _panel_headers() {
 # Браузер перед логином сначала грузит страницу панели: получает сессионную
 # куку и CSRF-токен. Свежие 3x-ui без этого отдают на POST голый 403 с
 # Content-Length: 0 и ничего не пишут в журнал. Повторяем тот же порядок.
+_b64url_d() {
+    local s=$1 pad
+    s=${s//-/+}; s=${s//_//}
+    pad=$(( ${#s} % 4 ))
+    (( pad )) && s+=$(printf '=%.0s' $(seq $(( 4 - pad ))))
+    printf '%s' "$s" | base64 -d 2>/dev/null || true
+}
+
+# CSRF_TOKEN лежит открытым текстом внутри сессионной куки 3x-ui. Она устроена
+# как gorilla/sessions: base64url("<unix-время>|base64url(gob)|<hmac>"), а в gob
+# записана пара CSRF_TOKEN -> значение. Подписано, но не зашифровано, поэтому
+# читается без ключа.
+_csrf_from_cookie() {
+    local raw outer mid
+    raw=$(awk '!/^#/ && NF >= 7 && $6 ~ /^(3x-ui|x-ui|session)$/ { print $7 }' \
+          "$NX_COOKIE" 2>/dev/null | tail -1)
+    [[ -n $raw ]] || return 1
+    outer=$(_b64url_d "$raw")
+    [[ $outer == *"|"* ]] || return 1
+    mid=$(cut -d'|' -f2 <<<"$outer")
+    [[ -n $mid ]] || return 1
+    _b64url_d "$mid" | tr -c 'A-Za-z0-9_-' '\n' \
+        | grep -A4 -x 'CSRF_TOKEN' \
+        | grep -xE '[A-Za-z0-9_-]{20,}' | head -1
+}
+
+# Браузер перед логином грузит страницу панели и получает сессионную куку с
+# CSRF-токеном. Свежие 3x-ui без него отдают на POST голый 403 с
+# Content-Length: 0 и ничего не пишут в журнал. Повторяем тот же порядок.
 _prime_session() {
-    local page="$NX_RUN/panel.html"
     rm -f "$NX_COOKIE"
     _panel_headers
-    curl -sS -c "$NX_COOKIE" -o "$page" --max-time 10 \
+    curl -sS -c "$NX_COOKIE" -o /dev/null --max-time 10 \
         "$(panel_base_url)" >/dev/null 2>&1 || true
-
-    # Токен ищем сначала в куке, затем в разметке страницы.
-    NX_CSRF=""
-    if [[ -s $NX_COOKIE ]]; then
-        NX_CSRF=$(awk '!/^#/ && NF >= 7 && tolower($6) ~ /csrf|xsrf/ { print $7 }' \
-                  "$NX_COOKIE" 2>/dev/null | tail -1)
+    NX_CSRF=$(_csrf_from_cookie || true)
+    if [[ -n ${NX_CSRF:-} ]]; then
+        info "CSRF-токен получен из сессионной куки"
+    else
+        warn "CSRF-токен не нашёлся в куке — если будет 403, дело в нём"
     fi
-    if [[ -z $NX_CSRF && -s $page ]]; then
-        NX_CSRF=$(grep -oiE '(csrf|xsrf)[a-z_-]*"?[^"]{0,20}"[^"]{8,}"' "$page" 2>/dev/null \
-                  | sed -n 's/.*"\([^"]\{8,\}\)"$/\1/p' | head -1)
-    fi
-    rm -f "$page"
-    [[ -n $NX_CSRF ]] && info "CSRF-токен получен со страницы панели"
     return 0
 }
 
@@ -251,6 +272,7 @@ _try_login() {
                    --data-urlencode "username=$PANEL_USER"
                    --data-urlencode "password=$PANEL_PASS")
     [[ -n ${NX_CSRF:-} ]] && args+=(-H "X-CSRF-Token: $NX_CSRF" -H "X-XSRF-TOKEN: $NX_CSRF")
+    [[ -n ${NX_CSRF:-} ]] && args+=(--data-urlencode "_csrf=$NX_CSRF")
     [[ -n $secret_field && -n ${PANEL_SECRET:-} ]] \
         && args+=(--data-urlencode "${secret_field}=$PANEL_SECRET")
     _post_form "$(panel_base_url)login" "$out" "${args[@]}"
@@ -298,6 +320,8 @@ panel_auth() {
             rm -f "$out"
             chmod 600 "$NX_COOKIE"
             PANEL_AUTH=cookie
+            # после входа сессия пересоздаётся — токен берём заново
+            NX_CSRF=$(_csrf_from_cookie || true)
             ok "API: сессия под пользователем $PANEL_USER (secret как '$used')"
             return 0
         fi
@@ -336,16 +360,22 @@ panel_auth() {
 }
 
 # api <GET|POST> <путь относительно base> [json-тело]
+# api <GET|POST> <путь относительно base> [json-тело]
 api() {
     local method=$1 path=$2 data=${3:-}
     _panel_headers
     local -a args=(-fsS --max-time 20 -X "$method" "${NX_HDR[@]}")
+
     case ${PANEL_AUTH:-} in
         token)  args+=(-H "Authorization: Bearer $PANEL_TOKEN") ;;
         cookie) args+=(-b "$NX_COOKIE" -c "$NX_COOKIE") ;;
-        *) die "panel_auth не вызывался" ;;
+        *)      die "panel_auth не вызывался" ;;
     esac
+
+    # CSRF-защита распространяется на все изменяющие запросы, не только логин.
+    [[ -n ${NX_CSRF:-} ]] && args+=(-H "X-CSRF-Token: $NX_CSRF" -H "X-XSRF-TOKEN: $NX_CSRF")
     [[ -n $data ]] && args+=(-H 'Content-Type: application/json' --data-binary "$data")
+
     curl "${args[@]}" "$(panel_base_url)${path}" 2>/dev/null
 }
 
