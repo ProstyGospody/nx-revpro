@@ -253,7 +253,7 @@ _csrf_from_cookie() {
     local raw outer mid
     # HttpOnly-куки curl пишет строкой "#HttpOnly_<домен>", поэтому отбрасывать
     # всё, что начинается с #, нельзя — именно так терялась нужная кука.
-    raw=$(awk 'NF >= 7 && $6 ~ /^(3x-ui|x-ui|session)$/ { print $7 }' \
+    raw=$(awk -F'\t' 'NF >= 7 && $6 ~ /^(3x-ui|x-ui|session)$/ { print $7 }' \
           "$NX_COOKIE" 2>/dev/null | tail -1)
     [[ -n $raw ]] || return 1
     outer=$(_b64url_d "$raw")
@@ -284,7 +284,7 @@ _prime_session() {
         if [[ ! -s $NX_COOKIE ]]; then
             warn "  файл кук $NX_COOKIE пуст: GET страницы панели не отдал Set-Cookie"
         else
-            warn "  куки в jar: $(awk 'NF >= 7 { printf "%s ", $6 }' "$NX_COOKIE")"
+            warn "  куки в jar: $(awk -F'\t' 'NF >= 7 { printf "%s ", $6 }' "$NX_COOKIE")"
         fi
     fi
     return 0
@@ -306,9 +306,23 @@ _try_login() {
 }
 
 # Подбирает рабочий способ аутентификации: PANEL_AUTH = token | cookie.
+# Между правкой настроек и логином панель успевает перезапуститься, а то и
+# упасть. Раньше скрипт ломился в неё вслепую и печатал «не тот пароль»,
+# хотя на порту никого не было.
+_ensure_panel_alive() {
+    panel_wait_up && [[ ${PANEL_ROOT_CODE:-000} != 000 ]] && return 0
+
+    err "на 127.0.0.1:${PANEL_WEB_PORT} никто не слушает — логиниться некуда"
+    err "systemctl is-active $XUI_SERVICE: $(systemctl is-active "$XUI_SERVICE" 2>/dev/null || true)"
+    err "последние строки журнала:"
+    journalctl -u "$XUI_SERVICE" -n 15 --no-pager 2>/dev/null | sed 's/^/      /' >&2 || true
+    return 1
+}
+
 panel_auth() {
     panel_load_credentials
     mkdir -p "$NX_RUN"; chmod 700 "$NX_RUN"
+    _ensure_panel_alive || die "панель не отвечает — до аутентификации дело не дошло"
     local base; base=$(panel_base_url)
 
     if [[ -n ${PANEL_TOKEN:-} ]]; then
