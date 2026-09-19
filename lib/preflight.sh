@@ -112,7 +112,7 @@ check_dns() {
 # он будет отвечать 404, пока systemd-экземпляр не может занять порт.
 preflight_ports() {
     local bind=$1 hit pid
-    local -a checks=("$bind 80" "$bind 443" "127.0.0.1 7443" "127.0.0.1 9443")
+    local -a checks=("0.0.0.0 80" "$bind 443" "127.0.0.1 7443" "127.0.0.1 9443")
     local c addr port
 
     for c in "${checks[@]}"; do
@@ -145,5 +145,5 @@ preflight_ports() {
     if [[ -n $hit ]] && ! grep -qE '"xray|"x-ui' <<<"$hit"; then
         die "127.0.0.1:443 занят не Xray: $(sed 's/.*users://' <<<"$hit")"
     fi
-    ok "порты свободны (nginx: ${bind}:80,${bind}:443,127.0.0.1:7443,127.0.0.1:9443)"
+    ok "порты свободны (nginx: :80, ${bind}:443, 127.0.0.1:7443, 127.0.0.1:9443)"
 }

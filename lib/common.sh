@@ -148,3 +148,6 @@ pid_cmdline() {
 }
 
 pids_from_ss() { grep -oE 'pid=[0-9]+' <<<"$1" | cut -d= -f2 | sort -u; }
+
+# Слушает ли кто-то ровно этот адрес и порт.
+listening() { ss -lntH 2>/dev/null | awk -v a="$1:$2" '$4 == a { f = 1 } END { exit !f }'; }

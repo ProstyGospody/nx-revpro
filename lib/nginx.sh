@@ -88,7 +88,9 @@ nginx_write_acme() {
         ACME_ROOT "$NX_ACME_ROOT" <<'TPL'
 # nx-revpro: ACME-челленджи и редирект на https.
 server {
-    listen @@BIND_IP@@:80;
+    # Порт 80 занимаем на всех адресах: привязка к конкретному IP здесь ничего
+    # не даёт, а при существующем listen 80 приводит к конфликту привязки.
+    listen 80;
     server_name @@PANEL_DOMAIN@@ @@DECOY_DOMAIN@@;
 
     location /.well-known/acme-challenge/ {
@@ -316,6 +318,7 @@ nginx_phase_acme() {
         rm -f "$NX_CONF_PANEL" "$NX_CONF_DECOY" "$NX_CONF_STREAM"
     fi
     nginx_reload
+    nginx_ensure_listening "0.0.0.0 80"
 }
 
 # Фаза 2: полный роутер. Сертификаты к этому моменту уже есть.
@@ -327,6 +330,7 @@ nginx_phase_full() {
     nginx_write_decoy
     nginx_write_stream
     nginx_reload
+    nginx_ensure_listening "0.0.0.0 80" "$BIND_IP 443" "127.0.0.1 $PANEL_HTTPS_PORT" "127.0.0.1 $DECOY_HTTPS_PORT"
 }
 
 # nginx -t проверяет синтаксис файла, но не то, что файл вообще включён:
@@ -342,4 +346,45 @@ nginx_assert_loaded() {
         die "конфиги nx-revpro не загружены"
     fi
     ok "конфиги nx-revpro загружены в nginx"
+}
+
+# reload не перепривязывает сокеты: старые воркеры держат прежние адреса, и
+# `nginx -s reload` возвращает 0, даже когда новый listen не смог забиндиться
+# (в error.log при этом [emerg] Address already in use, а обслуживает запросы
+# по-прежнему старый конфиг). Поэтому сверяем фактические сокеты и при
+# расхождении делаем полноценный restart.
+nginx_ensure_listening() {
+    local spec addr port missing=0
+    for spec in "$@"; do
+        read -r addr port <<<"$spec"
+        listening "$addr" "$port" || { missing=1; info "$addr:$port ещё не занят"; }
+    done
+    (( missing )) || return 0
+
+    warn "nginx не занял ожидаемые адреса — reload их не перепривязывает, перезапускаю"
+    systemctl restart nginx || {
+        err "последние строки error.log:"
+        tail -n 5 /var/log/nginx/error.log 2>/dev/null | sed 's/^/      /' >&2 || true
+        die "nginx restart не удался"
+    }
+
+    local i
+    for (( i = 0; i < 10; i++ )); do
+        missing=0
+        for spec in "$@"; do
+            read -r addr port <<<"$spec"
+            listening "$addr" "$port" || missing=1
+        done
+        (( missing )) || { ok "nginx слушает все ожидаемые адреса"; return 0; }
+        sleep 1
+    done
+
+    err "после перезапуска nginx всё равно не слушает нужные адреса:"
+    for spec in "$@"; do
+        read -r addr port <<<"$spec"
+        listening "$addr" "$port" || err "    $addr:$port"
+    done
+    err "последние строки error.log:"
+    tail -n 5 /var/log/nginx/error.log 2>/dev/null | sed 's/^/      /' >&2 || true
+    die "nginx не занял нужные адреса"
 }

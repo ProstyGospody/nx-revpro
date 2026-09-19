@@ -270,8 +270,7 @@ wait_listen() {
 
 # --- проверки --------------------------------------------------------------
 
-# Фильтры ss по-разному разбираются в разных версиях — проще отфильтровать сами.
-_listening() { ss -lntH 2>/dev/null | awk -v a="$1:$2" '$4 == a { f = 1 } END { exit !f }'; }
+_listening() { listening "$1" "$2"; }
 
 _http_code() {
     local host=$1 path=$2 code
@@ -285,7 +284,7 @@ _http_code() {
 do_verify() {
     local rc=0 code issuer spec a p name
 
-    for spec in "${BIND_IP} 443 nginx-stream" "${BIND_IP} 80 nginx-acme" \
+    for spec in "${BIND_IP} 443 nginx-stream" "0.0.0.0 80 nginx-acme" \
                 "127.0.0.1 ${PANEL_HTTPS_PORT} nginx-panel" \
                 "127.0.0.1 ${DECOY_HTTPS_PORT} nginx-decoy" \
                 "127.0.0.1 ${XRAY_PORT} xray-reality"; do
