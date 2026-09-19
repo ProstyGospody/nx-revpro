@@ -77,9 +77,24 @@ certs_issue() {
     fi
 
     info "certbot: $domain (staging=${STAGING:-0})"
-    certbot "${args[@]}" \
-        || die "certbot не выпустил сертификат для $domain — смотрите /var/log/letsencrypt/letsencrypt.log"
+    if ! certbot "${args[@]}"; then
+        # Переход с тестового CA на боевой certbot иногда не делает поверх
+        # существующего сертификата. Свой же staging-сертификат удалить не
+        # жалко: он всё равно не доверенный.
+        if [[ ${STAGING:-0} == 0 ]] && cert_is_staging "$domain"; then
+            warn "не удалось перевыпустить поверх тестового — удаляю его и пробую ещё раз"
+            certbot delete --cert-name "$domain" --non-interactive >/dev/null 2>&1 || true
+            certbot "${args[@]}" \
+                || die "certbot не выпустил сертификат для $domain — смотрите /var/log/letsencrypt/letsencrypt.log"
+        else
+            die "certbot не выпустил сертификат для $domain — смотрите /var/log/letsencrypt/letsencrypt.log"
+        fi
+    fi
     cert_exists "$domain" || die "certbot отработал, но $(cert_path "$domain") не появился"
+
+    if [[ ${STAGING:-0} == 0 ]] && cert_is_staging "$domain"; then
+        die "для $domain всё ещё лежит тестовый сертификат — браузер ему не поверит"
+    fi
     ok "сертификат $domain готов (осталось $(cert_days_left "$domain") дн.)"
 }
 
