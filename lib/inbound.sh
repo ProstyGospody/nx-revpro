@@ -25,6 +25,7 @@ inbound_find_by_port() {
 }
 
 # inbound_expected_hint — что именно должно быть заведено в панели.
+# inbound_expected_hint — что именно должно быть заведено в панели.
 inbound_expected_hint() {
     cat <<HINT
   Протокол        VLESS
@@ -36,7 +37,15 @@ inbound_expected_hint() {
     Dest          127.0.0.1:${DECOY_HTTPS_PORT}
     SNI           ${DECOY_DOMAIN}
   Transport       TCP
-    Proxy Protocol  ВКЛЮЧИТЬ
+    Proxy Protocol        ВКЛЮЧИТЬ
+  Custom share address    ${SHARE_ADDRESS:-$DECOY_DOMAIN}
+
+  Последние два поля легко пропустить, а без них не работает:
+    Proxy Protocol       — stream-роутер шлёт PROXY-заголовок, без него
+                           Xray примет его за мусор и оборвёт соединение;
+    Custom share address — инбаунд слушает 127.0.0.1, и без явного адреса
+                           панель подставит в ссылку что угодно, вплоть до
+                           адреса того, кто открыл панель.
 HINT
 }
 
@@ -74,6 +83,16 @@ inbound_check() {
     v=$(jq -r '.realitySettings.serverNames[0] // ""' <<<"$ss")
     [[ $v == "$DECOY_DOMAIN" ]] \
         || { err "serverNames[0] '$v', а сертификат выписан на $DECOY_DOMAIN"; bad=1; }
+
+    # Адрес в ссылке. Инбаунд слушает loopback, поэтому без явного Custom share
+    # address панель подставляет произвольный адрес — ссылки из UI не работают.
+    v=$(jq -r '.externalProxy[0].dest // ""' <<<"$ss")
+    if [[ -z $v ]]; then
+        warn "не задан Custom share address — ссылки, скопированные из панели, будут с неверным адресом"
+        warn "  впишите в инбаунде: ${SHARE_ADDRESS:-$DECOY_DOMAIN}"
+    elif [[ $v != "${SHARE_ADDRESS:-$DECOY_DOMAIN}" ]]; then
+        warn "Custom share address '$v', ожидался ${SHARE_ADDRESS:-$DECOY_DOMAIN}"
+    fi
 
     v=$(jq -r '[.settings | fromjson | .clients[]? | select(.flow != "xtls-rprx-vision")] | length' <<<"$inb" 2>/dev/null || echo 0)
     (( v == 0 )) || warn "у $v клиент(ов) flow не xtls-rprx-vision"

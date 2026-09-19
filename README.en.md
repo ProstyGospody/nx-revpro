@@ -170,6 +170,9 @@ it never calls the panel API and never reads `install-result.env`.
 
 - **The port in a share link** comes straight from the inbound's port. There is no separate
   field, and Custom share address only sets the address. Hence the inbound must live on 443.
+- **Custom share address is mandatory.** The inbound listens on `127.0.0.1`, so without an
+  explicit address the panel puts an arbitrary one into the link — possibly the address of
+  whoever opened the UI. Set it to the decoy domain.
 - **`subPath` sometimes fails to save** and resets to `/`. The script writes settings with the
   panel stopped, then reads them back after start-up and fails loudly if anything drifted.
 - **Proxy Protocol is not universal**: `ON` for REALITY, `OFF` for WS and XHTTP. If you add
