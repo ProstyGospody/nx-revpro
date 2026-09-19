@@ -24,6 +24,11 @@ NX_MARK_END='# END nx-revpro'
 
 nginx_prepare() {
     mkdir -p "$NX_NGINX_STREAM_DIR" "$NX_ACME_ROOT/.well-known/acme-challenge" "$NX_DECOY_ROOT"
+    # Права выставляем явно, а не полагаемся на umask: при строгом системном
+    # umask (077 на защищённых сборках) каталоги создаются с правами 700,
+    # nginx не может их пройти и отдаёт 404 при существующем файле.
+    find "$NX_WEBROOT" -type d -exec chmod 755 {} + 2>/dev/null || true
+    find "$NX_WEBROOT" -type f -exec chmod 644 {} + 2>/dev/null || true
     chown -R www-data:www-data "$NX_WEBROOT" 2>/dev/null || true
 
     # Дефолтный сайт Debian слушает 0.0.0.0:80 default_server и путается под ногами.

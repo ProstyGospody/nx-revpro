@@ -402,6 +402,8 @@ decoy_generate() {
     _decoy_index
     _decoy_legal
     _decoy_static
+    find "$NX_DECOY_ROOT" -type d -exec chmod 755 {} + 2>/dev/null || true
+    find "$NX_DECOY_ROOT" -type f -exec chmod 644 {} + 2>/dev/null || true
     chown -R www-data:www-data "$NX_DECOY_ROOT" 2>/dev/null || true
 
     state_set DECOY_BRAND "$DK_BRAND"

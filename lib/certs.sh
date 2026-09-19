@@ -130,6 +130,10 @@ certs_selftest() {
     err "Что реально загружено в nginx:"
     err "    nginx -T | grep -nE 'server_name|listen '"
     err ""
-    err "Уберите или переименуйте чужой блок для $domain и запустите install заново."
+    err "Последние ошибки nginx:"
+    tail -n 3 /var/log/nginx/error.log 2>/dev/null | sed 's/^/      /' >&2 || true
+    err ""
+    err "Права на пути webroot:"
+    namei -l "$NX_ACME_ROOT/.well-known/acme-challenge" 2>/dev/null | sed 's/^/      /' >&2 || true
     return 1
 }
