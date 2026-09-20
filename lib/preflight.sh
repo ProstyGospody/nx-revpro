@@ -16,16 +16,78 @@ preflight_os() {
     esac
 }
 
+# Сразу после старта системы блокировку dpkg обычно держит unattended-upgrades,
+# и apt-get падает, не дождавшись её. Ждать умеет сам apt (DPkg::Lock::Timeout,
+# есть начиная с apt 2.0 — Ubuntu 20.04 и Debian 11), но молча: поэтому сначала
+# сами смотрим, кто держит, и говорим об этом.
+NX_APT_LOCKS=(/var/lib/dpkg/lock-frontend /var/lib/dpkg/lock
+              /var/cache/apt/archives/lock /var/lib/apt/lists/lock)
+NX_APT_OPTS=(-o DPkg::Lock::Timeout=600)
+
+# PID держателя любой из блокировок apt, через /proc/locks — без psmisc и lsof.
+# Формат строки: индекс, тип, режим, rw, PID, major:minor:inode, начало, конец.
+# Держатель блокировки по её inode. Формат строки /proc/locks:
+#   индекс, тип, режим, rw, PID, major:minor:inode, начало, конец
+# Вынесено отдельно, чтобы разбор проверялся тестом на фикстуре, а не только
+# на живой системе.
+NX_PROC_LOCKS="${NX_PROC_LOCKS:-/proc/locks}"
+
+lock_pid_for_inode() {
+    local ino=$1 pid
+    [[ -n $ino && -r $NX_PROC_LOCKS ]] || return 1
+    pid=$(awk -v ino="$ino" '
+        { n = split($6, a, ":"); if (n >= 3 && a[n] == ino && $5 != "" && $5 != 0) { print $5; exit } }
+    ' "$NX_PROC_LOCKS" 2>/dev/null)
+    [[ -n $pid ]] || return 1
+    printf '%s' "$pid"
+}
+
+# PID держателя любой из блокировок apt — без psmisc и lsof.
+_apt_lock_pid() {
+    local f ino pid
+    for f in "${NX_APT_LOCKS[@]}"; do
+        [[ -e $f ]] || continue
+        ino=$(stat -c %i "$f" 2>/dev/null) || continue
+        pid=$(lock_pid_for_inode "$ino") || continue
+        printf '%s' "$pid"
+        return 0
+    done
+    return 1
+}
+
+apt_wait_lock() {
+    local limit=${1:-600} waited=0 pid name
+    pid=$(_apt_lock_pid) || return 0
+
+    name=$(tr -d '\0' < "/proc/$pid/comm" 2>/dev/null) || name="?"
+    warnm apt_locked "${name:-?}" "$pid"
+
+    while (( waited < limit )); do
+        sleep 5
+        waited=$(( waited + 5 ))
+        _apt_lock_pid >/dev/null || { okm apt_lock_free "$waited"; return 0; }
+        (( waited % 30 == 0 )) && infom apt_waiting "$waited"
+    done
+
+    warnm apt_lock_timeout "$limit"
+    return 0
+}
+
 preflight_packages() {
     local missing=() p
     for p in "${NX_PKGS[@]}"; do
         dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q "ok installed" || missing+=("$p")
     done
-    if (( ${#missing[@]} )); then
-        infom pkg_install "${missing[*]}"
-        DEBIAN_FRONTEND=noninteractive apt-get update -qq
-        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${missing[@]}" \
-            || diem pkg_fail "${missing[*]}"
+    (( ${#missing[@]} )) || { okm pkg_ok; return 0; }
+
+    infom pkg_install "${missing[*]}"
+    apt_wait_lock
+
+    DEBIAN_FRONTEND=noninteractive apt-get "${NX_APT_OPTS[@]}" update -qq || true
+    if ! DEBIAN_FRONTEND=noninteractive apt-get "${NX_APT_OPTS[@]}" install -y -qq "${missing[@]}"; then
+        errm pkg_fail "${missing[*]}"
+        errm pkg_fail_hint
+        exit 1
     fi
     okm pkg_ok
 }

@@ -148,6 +148,9 @@ it never calls the panel API.
   and verifies the result after start-up.
 - **Proxy Protocol is not universal**: `ON` for REALITY, `OFF` for WS and XHTTP.
 - **certbot via webroot only.** nginx already holds `:80` and must not be stopped.
+- **A fresh VPS is busy with automatic updates.** For the first minutes after boot
+  `unattended-upgrades` holds the dpkg lock and `apt-get` fails. The script waits for
+  it, naming the holder and reporting how long it has waited.
 - **`nginx -s reload` does not rebind sockets** and returns 0 even when a new `listen`
   failed to bind. That is why configs are applied with a restart.
 

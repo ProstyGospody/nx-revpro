@@ -34,16 +34,26 @@ die()  { printf '      %sx%s %s\n' "$C_RED" "$C_OFF" "$*" >&2; exit 1; }
 
 # --- зависимости бутстрапа -------------------------------------------------
 
-step "Зависимости"
+step "Зависимости / Dependencies"
 missing=()
 for c in curl tar; do command -v "$c" >/dev/null 2>&1 || missing+=("$c"); done
 if (( ${#missing[@]} )); then
-    info "ставлю: ${missing[*]}"
-    DEBIAN_FRONTEND=noninteractive apt-get update -qq
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${missing[@]}" \
-        || die "не смог поставить ${missing[*]}"
+    info "ставлю / installing: ${missing[*]}"
+    # Сразу после старта системы блокировку dpkg держит unattended-upgrades.
+    # DPkg::Lock::Timeout есть с apt 2.0; на более старых просто игнорируется.
+    waited=0
+    while [[ -r /proc/locks ]] && (( waited < 600 )); do
+        ino=$(stat -c %i /var/lib/dpkg/lock-frontend 2>/dev/null) || break
+        awk -v ino="$ino" '{ n = split($6, a, ":"); if (a[n] == ino) exit 0 } END { exit 1 }' \
+            /proc/locks || break
+        (( waited == 0 )) && info "жду блокировку dpkg / waiting for the dpkg lock"
+        sleep 5; waited=$(( waited + 5 ))
+    done
+    DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 update -qq || true
+    DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 install -y -qq "${missing[@]}" \
+        || die "не смог поставить / could not install: ${missing[*]}"
 fi
-ok "curl и tar на месте"
+ok "curl и tar на месте / curl and tar are present"
 
 # --- загрузка --------------------------------------------------------------
 

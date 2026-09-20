@@ -62,5 +62,27 @@ done
 i18n_load zz; is "$NX_LANG" "ru" "i18n: неизвестный язык откатывается на ru"
 is "$(_m no_such_key_at_all)" "<no_such_key_at_all>" "i18n: отсутствующий ключ виден"
 
+# --- разбор /proc/locks ------------------------------------------------------
+# Формат взят с живой Ubuntu 24.04: именно так выглядит строка, когда
+# unattended-upgrades держит /var/lib/dpkg/lock-frontend.
+NX_APT_LOCKS=(/nonexistent)
+NX_PROC_LOCKS="$TMP/locks"
+# shellcheck source=../lib/preflight.sh
+. lib/preflight.sh
+cat > "$NX_PROC_LOCKS" <<'LOCKS'
+1: POSIX  ADVISORY  WRITE 7758 08:02:2490369 0 EOF
+2: FLOCK  ADVISORY  WRITE 1103 00:19:1234 0 EOF
+3: POSIX  ADVISORY  READ  4242 08:02:9999999 0 EOF
+LOCKS
+is "$(lock_pid_for_inode 2490369)" "7758" "locks: держатель найден по inode"
+is "$(lock_pid_for_inode 9999999)" "4242" "locks: другая строка"
+is "$(lock_pid_for_inode 1234)"    "1103" "locks: короткий major:minor"
+if lock_pid_for_inode 555 >/dev/null 2>&1; then
+    printf 'FAIL locks: чужой inode не должен находиться\n'; failed=$(( failed + 1 ))
+else pass=$(( pass + 1 )); fi
+if lock_pid_for_inode "" >/dev/null 2>&1; then
+    printf 'FAIL locks: пустой inode не должен находиться\n'; failed=$(( failed + 1 ))
+else pass=$(( pass + 1 )); fi
+
 printf '\nпройдено: %s, провалено: %s\n' "$pass" "$failed"
 exit $(( failed > 0 ))

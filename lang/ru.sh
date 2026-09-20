@@ -219,3 +219,9 @@ M[usage]="  nxrev install --panel <домен> --decoy <домен> [--email <а
 
 Инбаунд заводится руками в панели: API 3x-ui меняется от версии к версии.
 Скрипт его находит, сверяет с конфигурацией nginx и показывает ссылки."
+
+M[apt_locked]="блокировка dpkg занята процессом %s (pid %s) — жду освобождения"
+M[apt_waiting]="жду %s с; на свежей системе unattended-upgrades держит её несколько минут"
+M[apt_lock_free]="блокировка освободилась через %s с"
+M[apt_lock_timeout]="блокировка не освободилась за %s с — пробую всё равно, apt подождёт сам"
+M[pkg_fail_hint]="если мешает автообновление: systemctl status unattended-upgrades"
