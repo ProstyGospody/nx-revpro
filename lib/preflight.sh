@@ -64,35 +64,36 @@ NX_APT_AUTO_UNITS=(unattended-upgrades.service apt-daily.service
 NX_APT_AUTO_TIMERS=(apt-daily.timer apt-daily-upgrade.timer)
 NX_STOPPED_UNITS=()
 
-# systemd-юнит процесса, если он к нему относится.
-_pid_unit() {
-    local pid=$1 line
-    [[ -n $pid && -r /proc/$pid/cgroup ]] || return 1
-    line=$(head -1 "/proc/$pid/cgroup" 2>/dev/null) || return 1
-    [[ $line =~ ([a-zA-Z0-9@._-]+\.service) ]] || return 1
-    printf '%s' "${BASH_REMATCH[1]}"
-}
-
-_is_auto_unit() {
-    local u=$1 x
-    for x in "${NX_APT_AUTO_UNITS[@]}"; do [[ $u == "$x" ]] && return 0; done
-    return 1
-}
 
 # Останавливаем автообновление и его таймеры, запоминая, что трогали.
-apt_stop_auto_updates() {
-    local u
+# Автообновление выключаем сразу, не дожидаясь, пока оно займёт блокировку:
+# установку запустил человек, и ждать фоновую задачу она не должна.
+#
+# Останавливаем штатно, через systemctl: systemd шлёт SIGTERM, и
+# unattended-upgrades доводит текущий пакет до конца. Ни kill -9, ни удаления
+# файлов блокировки — прерванная посреди транзакции dpkg оставляет базу
+# пакетов недоразобранной, и чинить это дольше, чем подождать.
+apt_disarm_auto_updates() {
+    local u waited=0
     for u in "${NX_APT_AUTO_UNITS[@]}" "${NX_APT_AUTO_TIMERS[@]}"; do
         systemctl is-active --quiet "$u" 2>/dev/null || continue
-        if systemctl stop "$u" >/dev/null 2>&1; then
-            NX_STOPPED_UNITS+=("$u")
-            infom apt_unit_stopped "$u"
-        fi
+        systemctl stop "$u" >/dev/null 2>&1 || continue
+        NX_STOPPED_UNITS+=("$u")
+        infom apt_unit_stopped "$u"
     done
-    (( ${#NX_STOPPED_UNITS[@]} ))
+    (( ${#NX_STOPPED_UNITS[@]} )) || return 0
+
+    infom apt_disarmed
+    while _apt_lock_pid >/dev/null && (( waited < 60 )); do
+        sleep 2; waited=$(( waited + 2 ))
+    done
+    # Доразбираем то, что осталось от прерванного обновления. На здоровой
+    # системе это ничего не делает.
+    infom apt_repair
+    DEBIAN_FRONTEND=noninteractive dpkg --configure -a >/dev/null 2>&1 || true
 }
 
-# Возвращаем таймеры: выключить автообновление насовсем мы не собирались.
+# Возвращаем таймеры: выключать автообновление насовсем мы не собирались.
 apt_restore_auto_updates() {
     local u
     (( ${#NX_STOPPED_UNITS[@]} )) || return 0
@@ -103,37 +104,20 @@ apt_restore_auto_updates() {
     NX_STOPPED_UNITS=()
 }
 
-# apt_wait_lock [сколько ждать до вмешательства]
-apt_wait_lock() {
-    local grace=${1:-${NX_APT_WAIT:-60}} waited=0 pid name unit
+# Если блокировку держит не автообновление, а человек в соседней сессии —
+# его работу не снимаем, а ждём: чужой apt прервать хуже, чем задержаться.
+apt_wait_foreign() {
+    local limit=${NX_APT_WAIT:-120} waited=0 pid name
     pid=$(_apt_lock_pid) || return 0
     name=$(tr -d '\0' < "/proc/$pid/comm" 2>/dev/null) || name="?"
-    unit=$(_pid_unit "$pid" || true)
-    warnm apt_locked "${name:-?}" "$pid"
+    warnm apt_foreign_holder "${name:-?}" "$pid"
 
-    # Короткое вежливое ожидание: часто хватает.
-    while (( waited < grace )); do
+    while (( waited < limit )); do
         sleep 5
         waited=$(( waited + 5 ))
         _apt_lock_pid >/dev/null || { okm apt_lock_free "$waited"; return 0; }
         (( waited % 30 == 0 )) && infom apt_waiting "$waited"
     done
-
-    # Дальше ждать бессмысленно. Автообновление снимаем, чужой apt — нет.
-    if [[ -n $unit ]] && _is_auto_unit "$unit"; then
-        infom apt_stopping "$unit"
-        apt_stop_auto_updates || true
-        waited=0
-        while (( waited < 60 )); do
-            _apt_lock_pid >/dev/null || break
-            sleep 2; waited=$(( waited + 2 ))
-        done
-        infom apt_repair
-        DEBIAN_FRONTEND=noninteractive dpkg --configure -a >/dev/null 2>&1 || true
-        return 0
-    fi
-
-    warnm apt_foreign_holder "${name:-?}" "$pid"
     return 0
 }
 
@@ -145,7 +129,8 @@ preflight_packages() {
     (( ${#missing[@]} )) || { okm pkg_ok; return 0; }
 
     infom pkg_install "${missing[*]}"
-    apt_wait_lock
+    apt_disarm_auto_updates
+    apt_wait_foreign
 
     DEBIAN_FRONTEND=noninteractive apt-get "${NX_APT_OPTS[@]}" update -qq || true
     if ! DEBIAN_FRONTEND=noninteractive apt-get "${NX_APT_OPTS[@]}" install -y -qq "${missing[@]}"; then

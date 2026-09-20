@@ -214,21 +214,21 @@ Install options:
   --regen-decoy         rebuild the decoy site from scratch
   --force               do not stop when DNS has not propagated yet
   --lang    ru|en       message language, remembered in the config
-  --apt-wait <seconds>  how long to wait for the dpkg lock before stopping
-                        automatic updates (default 60)
+  --apt-wait <seconds>  how long to wait for a foreign apt when the lock is not
+                        held by automatic updates (default 120)
   -y, --yes             skip the confirmation prompt (for uninstall)
   -h, --help            this help
 
 The inbound is created by hand in the panel: the 3x-ui API shifts between
 releases. The script finds it, checks it against nginx and prints the links."
 
-M[apt_locked]="the dpkg lock is held by %s (pid %s) — waiting for it"
 M[apt_waiting]="waited %s s; on a fresh system unattended-upgrades holds it for minutes"
 M[apt_lock_free]="the lock was released after %s s"
 M[pkg_fail_hint]="if automatic updates are in the way: systemctl status unattended-upgrades"
 
 M[apt_unit_stopped]="stopped %s"
-M[apt_stopping]="the lock is held by automatic updates (%s) — stopping the unit cleanly"
-M[apt_foreign_holder]="the lock is held by %s (pid %s) — not automatic updates, leaving it alone"
+M[apt_foreign_holder]="the lock is held by %s (pid %s) — not automatic updates, waiting instead of killing"
 M[apt_repair]="repairing dpkg after the interrupted upgrade"
 M[apt_timers_restored]="automatic update timers restored"
+
+M[apt_disarmed]="automatic updates stopped, waiting for the lock to clear"

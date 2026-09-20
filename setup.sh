@@ -52,12 +52,10 @@ if (( ${#missing[@]} )); then
         awk -v ino="$ino" '{ n = split($6, a, ":"); if (n >= 3 && a[n] == ino) exit 0 } END { exit 1 }' \
             /proc/locks
     }
-    waited=0
-    while dpkg_locked && (( waited < 60 )); do
-        (( waited == 0 )) && info "жду блокировку dpkg / waiting for the dpkg lock"
-        sleep 5; waited=$(( waited + 5 ))
-    done
-    if dpkg_locked; then
+    if systemctl is-active --quiet unattended-upgrades.service 2>/dev/null \
+       || systemctl is-active --quiet apt-daily.service 2>/dev/null \
+       || systemctl is-active --quiet apt-daily-upgrade.service 2>/dev/null \
+       || dpkg_locked; then
         info "останавливаю автообновление / stopping automatic updates"
         systemctl stop unattended-upgrades.service apt-daily.service \
                        apt-daily-upgrade.service apt-daily.timer \
