@@ -27,6 +27,7 @@ panel_restore_db() {
 rollback_on_failure() {
     local rc=$?
     (( rc == 0 )) && return 0
+    apt_restore_auto_updates
     (( NX_ROLLBACK_ARMED )) || return 0
     rollback_disarm
 

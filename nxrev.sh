@@ -84,7 +84,7 @@ CONF
 }
 
 parse_args() {
-    local need_value="--panel --decoy --email --bind-ip --share-address --remark --lang "
+    local need_value="--panel --decoy --email --bind-ip --share-address --remark --lang --apt-wait "
     while (( $# )); do
         [[ $need_value == *"$1 "* && $# -lt 2 ]] && diem arg_noval "$1"
         case $1 in
@@ -99,6 +99,7 @@ parse_args() {
             --regen-decoy)    REGEN_DECOY=1; shift ;;
             --force)          FORCE=1; shift ;;
             --lang)           i18n_load "$2"; shift 2 ;;
+            --apt-wait)       NX_APT_WAIT=$2; shift 2 ;;
             -y|--yes)         NX_ASSUME_YES=1; shift ;;
             -h|--help)        usage; exit 0 ;;
             *) diem arg_unknown "$1" ;;
@@ -182,6 +183,7 @@ cmd_install() {
     do_verify || warnm v_partial
 
     rollback_disarm
+    apt_restore_auto_updates
     print_summary
 }
 

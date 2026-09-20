@@ -55,21 +55,85 @@ _apt_lock_pid() {
     return 1
 }
 
-apt_wait_lock() {
-    local limit=${1:-600} waited=0 pid name
-    pid=$(_apt_lock_pid) || return 0
+# Юниты, которые держат dpkg сами по себе. Их останавливаем штатно: systemd
+# шлёт SIGTERM, unattended-upgrades доводит текущий пакет до конца и выходит.
+# Именно поэтому не kill -9 и тем более не rm блокировок: прерванная посреди
+# транзакции dpkg оставляет базу пакетов в полуразобранном состоянии, которое потом чинить.
+NX_APT_AUTO_UNITS=(unattended-upgrades.service apt-daily.service
+                   apt-daily-upgrade.service packagekit.service)
+NX_APT_AUTO_TIMERS=(apt-daily.timer apt-daily-upgrade.timer)
+NX_STOPPED_UNITS=()
 
+# systemd-юнит процесса, если он к нему относится.
+_pid_unit() {
+    local pid=$1 line
+    [[ -n $pid && -r /proc/$pid/cgroup ]] || return 1
+    line=$(head -1 "/proc/$pid/cgroup" 2>/dev/null) || return 1
+    [[ $line =~ ([a-zA-Z0-9@._-]+\.service) ]] || return 1
+    printf '%s' "${BASH_REMATCH[1]}"
+}
+
+_is_auto_unit() {
+    local u=$1 x
+    for x in "${NX_APT_AUTO_UNITS[@]}"; do [[ $u == "$x" ]] && return 0; done
+    return 1
+}
+
+# Останавливаем автообновление и его таймеры, запоминая, что трогали.
+apt_stop_auto_updates() {
+    local u
+    for u in "${NX_APT_AUTO_UNITS[@]}" "${NX_APT_AUTO_TIMERS[@]}"; do
+        systemctl is-active --quiet "$u" 2>/dev/null || continue
+        if systemctl stop "$u" >/dev/null 2>&1; then
+            NX_STOPPED_UNITS+=("$u")
+            infom apt_unit_stopped "$u"
+        fi
+    done
+    (( ${#NX_STOPPED_UNITS[@]} ))
+}
+
+# Возвращаем таймеры: выключить автообновление насовсем мы не собирались.
+apt_restore_auto_updates() {
+    local u
+    (( ${#NX_STOPPED_UNITS[@]} )) || return 0
+    for u in "${NX_STOPPED_UNITS[@]}"; do
+        [[ $u == *.timer ]] && systemctl start "$u" >/dev/null 2>&1 || true
+    done
+    okm apt_timers_restored
+    NX_STOPPED_UNITS=()
+}
+
+# apt_wait_lock [сколько ждать до вмешательства]
+apt_wait_lock() {
+    local grace=${1:-${NX_APT_WAIT:-60}} waited=0 pid name unit
+    pid=$(_apt_lock_pid) || return 0
     name=$(tr -d '\0' < "/proc/$pid/comm" 2>/dev/null) || name="?"
+    unit=$(_pid_unit "$pid" || true)
     warnm apt_locked "${name:-?}" "$pid"
 
-    while (( waited < limit )); do
+    # Короткое вежливое ожидание: часто хватает.
+    while (( waited < grace )); do
         sleep 5
         waited=$(( waited + 5 ))
         _apt_lock_pid >/dev/null || { okm apt_lock_free "$waited"; return 0; }
         (( waited % 30 == 0 )) && infom apt_waiting "$waited"
     done
 
-    warnm apt_lock_timeout "$limit"
+    # Дальше ждать бессмысленно. Автообновление снимаем, чужой apt — нет.
+    if [[ -n $unit ]] && _is_auto_unit "$unit"; then
+        infom apt_stopping "$unit"
+        apt_stop_auto_updates || true
+        waited=0
+        while (( waited < 60 )); do
+            _apt_lock_pid >/dev/null || break
+            sleep 2; waited=$(( waited + 2 ))
+        done
+        infom apt_repair
+        DEBIAN_FRONTEND=noninteractive dpkg --configure -a >/dev/null 2>&1 || true
+        return 0
+    fi
+
+    warnm apt_foreign_holder "${name:-?}" "$pid"
     return 0
 }
 

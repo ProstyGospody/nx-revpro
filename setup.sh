@@ -41,14 +41,31 @@ if (( ${#missing[@]} )); then
     info "ставлю / installing: ${missing[*]}"
     # Сразу после старта системы блокировку dpkg держит unattended-upgrades.
     # DPkg::Lock::Timeout есть с apt 2.0; на более старых просто игнорируется.
+    # Сразу после старта системы блокировку dpkg держит unattended-upgrades.
+    # Минуту ждём, дальше останавливаем его штатно — systemd даёт ему доделать
+    # текущий пакет. Ни kill -9, ни удаления файлов блокировки: прерванная
+    # посреди транзакции dpkg оставляет базу пакетов недоразобранной.
+    dpkg_locked() {
+        local ino
+        [[ -r /proc/locks ]] || return 1
+        ino=$(stat -c %i /var/lib/dpkg/lock-frontend 2>/dev/null) || return 1
+        awk -v ino="$ino" '{ n = split($6, a, ":"); if (n >= 3 && a[n] == ino) exit 0 } END { exit 1 }' \
+            /proc/locks
+    }
     waited=0
-    while [[ -r /proc/locks ]] && (( waited < 600 )); do
-        ino=$(stat -c %i /var/lib/dpkg/lock-frontend 2>/dev/null) || break
-        awk -v ino="$ino" '{ n = split($6, a, ":"); if (a[n] == ino) exit 0 } END { exit 1 }' \
-            /proc/locks || break
+    while dpkg_locked && (( waited < 60 )); do
         (( waited == 0 )) && info "жду блокировку dpkg / waiting for the dpkg lock"
         sleep 5; waited=$(( waited + 5 ))
     done
+    if dpkg_locked; then
+        info "останавливаю автообновление / stopping automatic updates"
+        systemctl stop unattended-upgrades.service apt-daily.service \
+                       apt-daily-upgrade.service apt-daily.timer \
+                       apt-daily-upgrade.timer >/dev/null 2>&1 || true
+        waited=0
+        while dpkg_locked && (( waited < 60 )); do sleep 2; waited=$(( waited + 2 )); done
+        DEBIAN_FRONTEND=noninteractive dpkg --configure -a >/dev/null 2>&1 || true
+    fi
     DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 update -qq || true
     DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 install -y -qq "${missing[@]}" \
         || die "не смог поставить / could not install: ${missing[*]}"

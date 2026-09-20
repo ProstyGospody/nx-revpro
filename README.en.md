@@ -149,8 +149,11 @@ it never calls the panel API.
 - **Proxy Protocol is not universal**: `ON` for REALITY, `OFF` for WS and XHTTP.
 - **certbot via webroot only.** nginx already holds `:80` and must not be stopped.
 - **A fresh VPS is busy with automatic updates.** For the first minutes after boot
-  `unattended-upgrades` holds the dpkg lock and `apt-get` fails. The script waits for
-  it, naming the holder and reporting how long it has waited.
+  `unattended-upgrades` holds the dpkg lock and `apt-get` fails. The script waits a
+  minute, then stops the unit cleanly and repairs dpkg with `dpkg --configure -a`.
+  Never `kill -9` and never deleting lock files: dpkg interrupted mid-transaction
+  leaves the package database half-unpacked. An `apt` started by a human is left
+  alone — only automatic updates are stopped. Tune the wait with `--apt-wait`.
 - **`nginx -s reload` does not rebind sockets** and returns 0 even when a new `listen`
   failed to bind. That is why configs are applied with a restart.
 
